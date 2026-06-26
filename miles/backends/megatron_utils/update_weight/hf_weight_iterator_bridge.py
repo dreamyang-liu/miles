@@ -146,7 +146,7 @@ def _chunk_atomic_units_by_size(units, chunk_size):
 
 def _process_conversion_tasks(vanilla_conversion_tasks, new_weight_dict):
     def _handle_one(task):
-        if task.param_weight is None:
+        if task is None or task.param_weight is None:
             return task
 
         weight_dict_key = f"vp_stages.{task.vp_stage}.{task.param_name}"
