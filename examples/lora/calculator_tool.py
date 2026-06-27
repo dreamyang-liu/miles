@@ -12,7 +12,7 @@ import re
 
 from miles.rollout.sglang_rollout import GenerateState
 from miles.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
-from miles.rollout.rm_hub.math_utils import extract_answer, grade_answer_mathd, grade_answer_sympy
+from miles.rollout.rm_hub.math_utils import grade_answer_mathd, grade_answer_sympy
 from miles.utils.http_utils import post
 from miles.utils.types import Sample
 
@@ -195,6 +195,47 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     return sample
 
 
+def _candidate_answers(final_text: str) -> list[str]:
+    """Extract candidate numeric answers from the final assistant text, most
+    likely first. Robust to thousands separators, trailing units/punctuation,
+    and answers that are not on the very last line.
+
+    Order of preference:
+      1. \\boxed{...} content
+      2. numbers following an explicit answer cue ("answer is X", "= X", "is X")
+      3. any number in the final text (last one first)
+    """
+    # Normalize thousands separators so "1,000" -> "1000" (avoid splitting into "000").
+    text = re.sub(r'(?<=\d),(?=\d{3}\b)', '', final_text)
+
+    candidates: list[str] = []
+
+    def _push(num: str):
+        num = num.rstrip('.')  # strip trailing sentence period, keep decimals like 5.0
+        if num and num not in candidates:
+            candidates.append(num)
+
+    num_re = r'[-+]?\d+(?:\.\d+)?'
+
+    # 1. \boxed{...}
+    for m in re.findall(r'\\boxed\{([^}]*)\}', text):
+        for n in re.findall(num_re, m):
+            _push(n)
+
+    # 2. explicit answer cues (search whole final text, last match is usually the conclusion)
+    cue_re = re.compile(r'(?:answer\s*(?:is|:|=)|final answer\s*(?:is|:|=)?|=)\s*\$?\s*(' + num_re + r')', re.IGNORECASE)
+    cue_matches = cue_re.findall(text)
+    for n in reversed(cue_matches):
+        _push(n)
+
+    # 3. fallback: any number in the final text, last occurrence first
+    all_nums = re.findall(num_re, text)
+    for n in reversed(all_nums):
+        _push(n)
+
+    return candidates
+
+
 async def reward_func(args, sample: Sample, **kwargs):
     """Reward = deepscaler math correctness, with fallback for tool-calling format."""
     ground_truth = sample.label if sample.label is not None else ""
@@ -209,15 +250,9 @@ async def reward_func(args, sample: Sample, **kwargs):
         else:
             final_text = sample.response
 
-        model_answer = extract_answer(final_text)
-        if model_answer is None:
-            # No \boxed{} found — try to extract a bare number from the final text
-            numbers = re.findall(r'[-+]?\d*\.?\d+', final_text.split('\n')[-1] if final_text.strip() else "")
-            model_answer = numbers[-1] if numbers else None
-
-        if model_answer is not None:
-            for gt in [str(ground_truth)]:
-                if grade_answer_mathd(model_answer, gt) or grade_answer_sympy(model_answer, gt):
-                    result = 1
-                    break
+        gt = str(ground_truth)
+        for model_answer in _candidate_answers(final_text):
+            if grade_answer_mathd(model_answer, gt) or grade_answer_sympy(model_answer, gt):
+                result = 1
+                break
     return result
