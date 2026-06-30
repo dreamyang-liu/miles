@@ -38,6 +38,11 @@ LORA_ARGS=(
    --lora-dropout 0.0
    --target-modules "all-linear"
    --megatron-to-hf-mode bridge
+   # Installed SGLang requires a begin/end weight-update session for the base
+   # sync (update_weights_from_tensor). For colocated LoRA the base never changes,
+   # so keep the SGLang-side CPU mirror of base weights and skip the per-step base
+   # sync entirely (only the LoRA adapter is pushed, which needs no session).
+   --lora-base-cpu-backup
 )
 
 ROLLOUT_ARGS=(
