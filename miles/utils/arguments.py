@@ -602,6 +602,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="V3: maximum model invocations per trajectory (default 64), independent of group size.",
             )
+            parser.add_argument(
+                "--ash-rollout-branching",
+                action="store_true",
+                default=False,
+                help=(
+                    "V3: request Ash review-guided branching. Requires two samples per prompt "
+                    "and a configured Ash reviewer; returns the root and a selected branch."
+                ),
+            )
             parser.set_defaults(
                 _ash_rollout_max_model_calls_explicit=False,
                 _ash_rollout_max_tool_calls_explicit=False,

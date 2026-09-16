@@ -33,7 +33,27 @@ The existing v2 interface below remains available for exact-token trajectories.
 See `examples/swe-rebench-ash/README.md` for data preparation, the matching Ash
 configuration, supported sampling controls and training options. V3 does not
 require a Session Server token-recording bridge or a Miles-owned environment
-catalog, and does not introduce a branch-search or credit-assignment algorithm.
+catalog. Optional review-guided branching is described below; it does not change
+shared-prefix credit assignment.
+
+### Review-guided branching
+
+With a compatible Ash driver and configured reviewer, set
+`--ash-rollout-branching --n-samples-per-prompt 2`. Ash runs and grades one root
+per prompt, then reviews failed roots to seek a resolved child and successful
+roots to seek an unresolved child. Its default limit is two rounds with one
+branch per round, stopping on the first opposite signal.
+
+Ash returns the root and selected child as a fixed pair. Intermediate attempts
+remain in Ash's execution records. If both children have the root's reward, the
+last child is selected. Missing recovery points or invalid execution can leave
+an incomplete pair; Miles rejects that shortfall rather than padding samples.
+Prompts progress independently.
+
+Injected branch hints are removed before export. Miles rebuilds tokens/masks
+and recomputes logprobs as for ordinary v3 samples; this does not introduce
+tree-specific weighting. The flag defaults off and is omitted from the wire
+when disabled, preserving compatibility with existing v3 drivers.
 
 ## Exact-token trajectories (v2)
 

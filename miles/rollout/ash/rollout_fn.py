@@ -324,6 +324,8 @@ def _legacy_call_limits(args: Any) -> tuple[int | None, int | None]:
 
 def _validate_configuration(args: Any) -> None:
     _validate_common_configuration(args)
+    if getattr(args, "ash_rollout_branching", False):
+        raise ValueError("--ash-rollout-branching requires AshMessageRolloutFn (v3)")
     if args.ash_rollout_client_grace_seconds <= 0:
         raise ValueError("--ash-rollout-client-grace-seconds must be greater than zero")
     model_calls, tool_calls = _legacy_call_limits(args)

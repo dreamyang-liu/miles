@@ -82,10 +82,13 @@ including any literal mention of a hint. Historical unmarked hints cannot be
 reliably identified automatically. Incomplete tool histories, compaction and
 unsupported native content fail export explicitly.
 
-The driver still allocates independent samples by default; this change does not
-introduce a branch-search policy or alter shared-prefix credit/weighting. Branches
-produced by Ash's existing execution path retain their provenance. Every returned
-sample still occupies a Miles-allocated slot.
+The driver allocates independent samples by default. With a compatible Ash driver
+and configured reviewer, add `--ash-rollout-branching --n-samples-per-prompt 2`
+to the training arguments. Ash runs one root, grades it, and performs up to two
+review-guided branch rounds: failed roots seek a positive example, successful
+roots seek a negative example. It returns the root and selected child, with hints
+removed and lineage retained. Each returned sample occupies an allocated slot;
+incomplete pairs are rejected. Shared-prefix credit/weighting is unchanged.
 
 For a single real Qwen3.8-27B update on eight GPUs, convert the checkpoint with
 the existing `qwen3.8-27B` model definition, then run:

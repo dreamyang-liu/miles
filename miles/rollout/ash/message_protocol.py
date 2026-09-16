@@ -44,6 +44,13 @@ class AshMessageRequest(FrozenStrictBaseModel):
     finalization_timeout_seconds: float = Field(default=1800.0, strict=True, gt=0, allow_inf_nan=False)
     sampling_params: dict[str, Any] = Field(default_factory=dict)
     budgets: AshMessageBudget
+    branching: bool = Field(default=False, strict=True)
+
+    def to_wire(self) -> dict[str, Any]:
+        value = self.model_dump(mode="json")
+        if not self.branching:
+            del value["branching"]
+        return value
 
     @model_validator(mode="after")
     def validate_slots(self) -> "AshMessageRequest":

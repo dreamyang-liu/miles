@@ -25,7 +25,7 @@ from miles.utils.processing_utils import load_tokenizer
 
 class AshMessageClient(AshRolloutClient):
     async def submit(self, request: AshMessageRequest) -> AshMessageAcknowledgement:
-        response = await self._client.post("/rollout-groups", json=request.model_dump(mode="json"))
+        response = await self._client.post("/rollout-groups", json=request.to_wire())
         response.raise_for_status()
         return AshMessageAcknowledgement.model_validate(response.json())
 
@@ -79,6 +79,11 @@ class AshMessageRolloutFn(AshRolloutFn):
 
     def _validate_configuration(self) -> None:
         _validate_common_configuration(self._args)
+        branching = getattr(self._args, "ash_rollout_branching", False)
+        if type(branching) is not bool:
+            raise ValueError("--ash-rollout-branching must be boolean")
+        if branching and self._args.n_samples_per_prompt != 2:
+            raise ValueError("--ash-rollout-branching requires --n-samples-per-prompt 2")
         for name in ("ash_rollout_max_model_calls", "ash_rollout_max_tool_calls"):
             explicit = getattr(self._args, f"_{name}_explicit", None)
             if explicit is True or (explicit is None and getattr(self._args, name, None) is not None):
@@ -132,6 +137,7 @@ class AshMessageRolloutFn(AshRolloutFn):
             budgets=AshMessageBudget(
                 max_wall_time_seconds=self._rollout_timeout_seconds,
             ),
+            branching=getattr(self._args, "ash_rollout_branching", False),
         )
         return request, dict(zip((slot.sample_slot_id for slot in slots), group, strict=True))
 

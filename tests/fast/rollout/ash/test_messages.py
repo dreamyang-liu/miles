@@ -3,6 +3,7 @@ import asyncio
 import json
 import sys
 from argparse import Namespace
+from copy import deepcopy
 from unittest.mock import patch
 
 import httpx
@@ -307,6 +308,80 @@ def test_unset_output_limit_leaves_native_default():
     fn = AshMessageRolloutFn(RolloutFnConstructorInput(args=args(rollout_max_response_len=None), data_source=None))
     request, _ = fn._build_request(group=group(), rollout_id=1, weight_version=7)
     assert "max_new_tokens" not in request.sampling_params
+
+
+def test_branching_off_preserves_the_old_wire_and_real_cli_defaults():
+    fn = AshMessageRolloutFn(RolloutFnConstructorInput(args=args(), data_source=None))
+    request, _ = fn._build_request(group=group(), rollout_id=1, weight_version=7)
+    assert not request.branching and "branching" not in request.to_wire()
+    from miles.utils.arguments import get_miles_extra_args_provider
+
+    parser = argparse.ArgumentParser()
+    with patch.object(sys, "argv", ["test", "--rollout-batch-size", "1"]):
+        get_miles_extra_args_provider()(parser)
+        assert not parser.parse_args(["--rollout-batch-size", "1"]).ash_rollout_branching
+        assert parser.parse_args(["--rollout-batch-size", "1", "--ash-rollout-branching"]).ash_rollout_branching
+
+
+@pytest.mark.parametrize("count", [1, 3, 8])
+def test_branching_requires_a_fixed_pair(count):
+    with pytest.raises(ValueError, match="n-samples-per-prompt 2"):
+        AshMessageRolloutFn(RolloutFnConstructorInput(
+            args=args(ash_rollout_branching=True, n_samples_per_prompt=count), data_source=None,
+        ))
+
+
+@pytest.mark.parametrize("root_reward", [0.0, 1.0])
+def test_branching_request_and_opposite_pair_import(mask_generator, root_reward):
+    sent, deleted = [], []
+
+    def handler(request):
+        if request.method == "POST":
+            body = json.loads(request.content)
+            sent.append(body)
+            assert body["branching"] is True
+            assert body["max_samples"] == body["minimum_returned_samples"] == 2
+            return httpx.Response(202, json={
+                "protocol_version": "ash-rollout-v3", "rollout_job_id": body["rollout_job_id"], "status": "queued",
+            })
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            return httpx.Response(200, json={
+                "protocol_version": "ash-rollout-v3",
+                "rollout_job_id": sent[0]["rollout_job_id"], "status": "completed",
+            })
+        body = payload()
+        child = deepcopy(body["trajectories"][0])
+        body.update(rollout_job_id=sent[0]["rollout_job_id"], max_samples=2, actual_samples=2, search_branches=1)
+        body["trajectories"].append(child)
+        for i, trajectory in enumerate(body["trajectories"]):
+            trajectory.update(
+                sample_slot_id=sent[0]["sample_slots"][i]["sample_slot_id"],
+                branch_id="root" if i == 0 else "child",
+                parent_branch_id=None if i == 0 else "root",
+                reward=root_reward if i == 0 else 1.0 - root_reward,
+                metadata={"branching": {"round": i, "stop_reason": "target_found"}},
+            )
+        return httpx.Response(200, json=body)
+
+    async def run():
+        fn = AshMessageRolloutFn(RolloutFnConstructorInput(
+            args=args(ash_rollout_branching=True, n_samples_per_prompt=2), data_source=None,
+        ))
+        fn._mask_generator = mask_generator
+        samples = [group()[0], deepcopy(group()[0])]
+        samples[1].index += 1
+        async with AshMessageClient(
+            "http://ash", client=httpx.AsyncClient(base_url="http://ash", transport=httpx.MockTransport(handler)),
+        ) as client:
+            return await fn._run_group(client=client, group=samples, rollout_id=1, weight_version=7)
+
+    samples, _result = asyncio.run(run())
+    assert len(deleted) == 1 and len(samples) == 2
+    assert [sample.reward for sample in samples] == [root_reward, 1.0 - root_reward]
+    assert samples[1].metadata["ash_rollout"]["parent_branch_id"] == "root"
+    assert all(sample.rollout_log_probs is None and any(sample.loss_mask) for sample in samples)
+    assert len({sample.index for sample in samples}) == 2
 
 
 @pytest.mark.parametrize("group_size", [1, 2, 8])
