@@ -146,6 +146,10 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     provider.distribute_saved_activations = args.distribute_saved_activations
     provider.attention_backend = args.attention_backend
     provider.variable_seq_lengths = True
+    if getattr(args, "mtp_num_layers", None) is not None:
+        provider.mtp_num_layers = args.mtp_num_layers
+    if getattr(args, "make_vocab_size_divisible_by", None) is not None:
+        provider.make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
     provider.moe_token_dispatcher_type = "alltoall"
     provider.moe_router_load_balancing_type = "none"
     if is_multi_lora_enabled(args) and targets_expert_leaves(args.target_modules):

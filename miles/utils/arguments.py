@@ -39,6 +39,14 @@ def _optional_call_limit(value: str) -> int | None:
         ) from exc
 
 
+class _StoreAshCallLimit(argparse.Action):
+    """Distinguish v2 defaults from explicit count flags when selecting v3."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_explicit", True)
+
+
 def resolve_rollout_function_paths(args) -> tuple[str, str]:
     """The (rollout, eval) function paths the arguments select."""
     if use_legacy_rollout_v1():
@@ -583,21 +591,39 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Timeout for an individual Miles-to-Ash HTTP request.",
             )
             parser.add_argument(
+                "--ash-rollout-finalization-timeout-seconds",
+                type=float,
+                default=1800.0,
+                help="V3: additional time after the execution deadline for snapshot export and Ash grading.",
+            )
+            parser.add_argument(
+                "--ash-rollout-max-turns",
+                type=int,
+                default=None,
+                help="V3: maximum model invocations per trajectory (default 64), independent of group size.",
+            )
+            parser.set_defaults(
+                _ash_rollout_max_model_calls_explicit=False,
+                _ash_rollout_max_tool_calls_explicit=False,
+            )
+            parser.add_argument(
                 "--ash-rollout-max-model-calls",
                 type=_optional_call_limit,
+                action=_StoreAshCallLimit,
                 default=100,
                 help=(
-                    "Maximum model calls Ash may use for one prompt group, or "
-                    "'unbounded' to rely on wall time, cancellation and model context."
+                    "V2 only: maximum model calls per prompt group (default 100), or "
+                    "'unbounded'. V3 uses --ash-rollout-max-turns."
                 ),
             )
             parser.add_argument(
                 "--ash-rollout-max-tool-calls",
                 type=_optional_call_limit,
+                action=_StoreAshCallLimit,
                 default=100,
                 help=(
-                    "Maximum tool calls Ash may use for one prompt group, or "
-                    "'unbounded' to rely on wall time and cancellation."
+                    "V2 only: maximum tool calls per prompt group (default 100), or "
+                    "'unbounded'. V3 has no tool-call count cap."
                 ),
             )
             parser.add_argument(

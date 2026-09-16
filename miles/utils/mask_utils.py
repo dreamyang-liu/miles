@@ -75,29 +75,30 @@ class MultiTurnLossMaskGenerator:
 
         return all_token_ids, all_loss_masks
 
-    def gen_multi_turn_loss_mask_qwen3(
-        self, messages: list[dict], tools: list[dict] = None
-    ) -> tuple[list[int], list[int]]:
+    def gen_multi_turn_loss_mask_qwen3(self, messages: list[dict], tools: list[dict] = None) -> tuple[list[int], list[int]]:
         all_loss_masks = []
         all_token_ids = []
 
         prefix_message = {"role": "user", "content": "FOR CALCULATING LOSS MASK ONLY"}
         prefix_token_ids = self.tokenizer.apply_chat_template([prefix_message], tokenize=True, return_dict=False)
+        prefix_body_ids = prefix_token_ids[self.system_message_length :]
+        if not prefix_body_ids:
+            raise ValueError("chat template produced an empty prefix message")
 
         for i, message in enumerate(messages):
             if i == 0:
-                tailed_message_ids = self.tokenizer.apply_chat_template(
-                    [message, prefix_message], tokenize=True, return_dict=False, tools=tools
-                )
-                message_ids = tailed_message_ids[: -len(prefix_token_ids)]
+                tailed_message_ids = self.tokenizer.apply_chat_template([message, prefix_message], tokenize=True, return_dict=False, tools=tools)
+                # The standalone prefix includes the template's implicit system
+                # preamble; only its message body occurs at the end here.
+                if tailed_message_ids[-len(prefix_body_ids) :] != prefix_body_ids:
+                    raise ValueError("chat template does not preserve the trailing mask prefix")
+                message_ids = tailed_message_ids[: -len(prefix_body_ids)]
             else:
-                prefixed_message_ids = self.tokenizer.apply_chat_template(
-                    [prefix_message, message], tokenize=True, return_dict=False
-                )
+                prefixed_message_ids = self.tokenizer.apply_chat_template([prefix_message, message], tokenize=True, return_dict=False)
+                if prefixed_message_ids[: len(prefix_token_ids)] != prefix_token_ids:
+                    raise ValueError("chat template does not preserve the leading mask prefix")
+                # Removing the complete prefix already removes the preamble.
                 message_ids = prefixed_message_ids[len(prefix_token_ids) :]
-
-            if message["role"] != "system" and i > 0:
-                message_ids = message_ids[self.system_message_length :]
 
             if message["role"] == "assistant":
                 loss_mask = [0] * self.gen_token_length + [1] * (len(message_ids) - self.gen_token_length)

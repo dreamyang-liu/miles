@@ -22,7 +22,6 @@ from miles.rollout.base_types import (
     RolloutFnTrainOutput,
 )
 from miles.rollout.rm_hub import batched_async_rm
-from miles.utils import chat_template_utils
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.types import Sample
 
@@ -51,8 +50,11 @@ class AshRolloutFn:
         self._client_grace_seconds = self._args.ash_rollout_client_grace_seconds
         self._http_timeout_seconds = self._args.ash_rollout_http_timeout_seconds
         self._tokenizer = None
-        _validate_configuration(self._args)
+        self._validate_configuration()
         self._sampling_params = _sampling_params(self._args)
+
+    def _validate_configuration(self) -> None:
+        _validate_configuration(self._args)
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if isinstance(input, RolloutFnEvalInput):
@@ -164,6 +166,7 @@ class AshRolloutFn:
         ]
         slot_samples = dict(zip((slot.sample_slot_id for slot in slots), group, strict=True))
         max_samples = len(slots)
+        max_model_calls, max_tool_calls = _legacy_call_limits(self._args)
         request = AshRolloutRequest(
             rollout_job_id=job_id,
             rollout_id=rollout_id,
@@ -181,8 +184,8 @@ class AshRolloutFn:
             return_rollout_logprobs=self._args.use_rollout_logprobs,
             sampling_params=dict(self._sampling_params),
             budgets=AshRolloutBudget(
-                max_model_calls=self._args.ash_rollout_max_model_calls,
-                max_tool_calls=self._args.ash_rollout_max_tool_calls,
+                max_model_calls=max_model_calls,
+                max_tool_calls=max_tool_calls,
                 max_wall_time_seconds=self._rollout_timeout_seconds,
             ),
             # Phase one deliberately keeps Miles' existing fixed group-size semantics.
@@ -234,6 +237,9 @@ class AshRolloutFn:
             )
         if isinstance(sample.prompt, str):
             return self._tokenizer.encode(sample.prompt, add_special_tokens=False)
+        # Message-mode v3 does not need SGLang's exact-token template helpers.
+        from miles.utils import chat_template_utils
+
         tools = sample.metadata.get("tools") if sample.metadata else None
         return chat_template_utils.apply_chat_template(
             sample.prompt,
@@ -296,23 +302,37 @@ def _sampling_params(args: Any) -> dict[str, Any]:
     return params
 
 
-def _validate_configuration(args: Any) -> None:
+def _validate_common_configuration(args: Any) -> None:
     positive_values = {
         "ash_rollout_poll_interval_seconds": args.ash_rollout_poll_interval_seconds,
         "ash_rollout_timeout_seconds": args.ash_rollout_timeout_seconds,
-        "ash_rollout_client_grace_seconds": args.ash_rollout_client_grace_seconds,
         "ash_rollout_http_timeout_seconds": args.ash_rollout_http_timeout_seconds,
     }
-    if args.ash_rollout_max_model_calls is not None:
-        positive_values["ash_rollout_max_model_calls"] = args.ash_rollout_max_model_calls
     for name, value in positive_values.items():
         if value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be greater than zero")
-    if (
-        args.ash_rollout_max_tool_calls is not None
-        and args.ash_rollout_max_tool_calls < 0
-    ):
+
+
+def _legacy_call_limits(args: Any) -> tuple[int | None, int | None]:
+    # Missing programmatic values use the v2 defaults; explicit None stays
+    # unbounded, as in the published v2 contract.
+    return (
+        getattr(args, "ash_rollout_max_model_calls", 100),
+        getattr(args, "ash_rollout_max_tool_calls", 100),
+    )
+
+
+def _validate_configuration(args: Any) -> None:
+    _validate_common_configuration(args)
+    if args.ash_rollout_client_grace_seconds <= 0:
+        raise ValueError("--ash-rollout-client-grace-seconds must be greater than zero")
+    model_calls, tool_calls = _legacy_call_limits(args)
+    if model_calls is not None and model_calls <= 0:
+        raise ValueError("--ash-rollout-max-model-calls must be greater than zero")
+    if tool_calls is not None and tool_calls < 0:
         raise ValueError("--ash-rollout-max-tool-calls must be non-negative")
+    if getattr(args, "ash_rollout_max_turns", None) is not None:
+        raise ValueError("--ash-rollout-max-turns requires AshMessageRolloutFn (v3)")
 
 
 def _validate_group(group: list[Sample]) -> tuple[str, str | list[dict[str, Any]]]:

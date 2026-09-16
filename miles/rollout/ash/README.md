@@ -1,5 +1,42 @@
 # Ash rollout backend
 
+## Hint-free message training (v3)
+
+For Ash-generated branches whose hints are removed before training, select
+`miles.rollout.ash.message_rollout.AshMessageRolloutFn`. The additive
+`ash-rollout-v3` contract sends `task_id`, `image`, prompt, slots and native
+sampling controls; Ash returns cleaned messages, tool schemas, branch provenance
+and reward. Miles constructs fresh tokens/loss masks and uses the trainer's
+normal logprob forward pass. It does not reuse rollout token positions or
+hint-conditioned logprobs.
+
+Set `--ash-rollout-max-turns N` (default 64) to limit each trajectory to N
+model invocations. Tools requested by those invocations do not consume turns
+and have no separate call-count cap. The limit is independent of prompt-group
+size: eight samples each receive N turns. The v3 wire request contains
+`"max_turns": N` and `"budgets": {"max_wall_time_seconds": ...}`.
+`--ash-rollout-max-model-calls` and `--ash-rollout-max-tool-calls` are v2-only;
+v3 rejects them and the corresponding old wire fields.
+V2 retains its 100/100 CLI defaults and explicit `unbounded`/JSON `null`
+semantics. An Ash v2 deployment must also support nullable call budgets before
+using those values; v3 uses its own `max_turns` contract instead.
+The group execution deadline, actor timeout, and output-token limit remain
+independent. On an execution timeout or turn cutoff, Ash captures the final
+quiescent sandbox, grades it, and returns `status="truncated"` with
+`stop_reason="timeout"` or `"max_turns_reached"`. Miles preserves this reason
+in the sample's `ash_rollout` metadata and recomputes logprobs as usual.
+`--ash-rollout-finalization-timeout-seconds` (default 1800) gives snapshot
+export and grading additional time after the execution deadline. Uncertain
+tool execution and missing/invalid training histories remain explicit errors.
+
+The existing v2 interface below remains available for exact-token trajectories.
+See `examples/swe-rebench-ash/README.md` for data preparation, the matching Ash
+configuration, supported sampling controls and training options. V3 does not
+require a Session Server token-recording bridge or a Miles-owned environment
+catalog, and does not introduce a branch-search or credit-assignment algorithm.
+
+## Exact-token trajectories (v2)
+
 The Ash rollout backend delegates one complete prompt group to an external
 agent rollout service while Miles remains responsible for training. It is
 intended for rollout strategies that need to grow branches, checkpoint and

@@ -266,7 +266,27 @@ base re-ship). Anything that double-books breaks it. The flags that hold the lin
 Healthy peaks sit at **600–650 GB per node**; sustained readings above ~750 GB mean a
 second backup or the page cache came back.
 
-## 7. Pairs Well With
+## 7. Ash message rollouts (27B)
+
+`examples/swe-rebench-ash/run_qwen3_8_27b.py` runs the dense 27B model with
+Ash-owned environments and rewards. Ash returns cleaned messages; Miles
+rebuilds tokens/loss masks and recomputes logprobs. Prepare the task data using
+`examples/swe-rebench-ash/prepare_data.py` and configure an Ash v3 driver/worker.
+
+```bash
+python examples/swe-rebench-ash/run_qwen3_8_27b.py \
+  --model-dir /root/models --data-dir /tmp/swe-inputs \
+  --output-dir /root/shared_data/ash-tp8 \
+  --ash-url http://ASH_DRIVER:11001 \
+  --model-endpoint https://MODEL_HOST \
+  --max-turns 300
+```
+
+The example uses one eight-GPU TP group and supports LoRA training from recorded
+rollouts. See `examples/swe-rebench-ash/README.md` for endpoint requirements,
+cutoff grading, loss-mask selection and the current live-LoRA limitation.
+
+## 8. Pairs Well With
 
 - [Qwen3.5](/models/qwen/qwen3-5) — same architecture at 4 B / 9 B / 27 B
 - [True On-Policy](/examples/infra-features/true-on-policy)

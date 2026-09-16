@@ -14,6 +14,16 @@ session behavior, token ownership, model-family selection, and verification.
 Use [Generate Endpoint](/user-guide/generate-endpoint) for the lower-level,
 stateless `/generate` interface.
 
+For an external Ash agent that removes branch hints before returning its
+conversation, select
+`miles.rollout.ash.message_rollout.AshMessageRolloutFn`. That v3 backend imports
+cleaned messages and Ash rewards, rebuilds the training tokens/loss masks, and
+requires the trainer to recompute logprobs. It uses per-trajectory
+`--ash-rollout-max-turns` and does not require a Session Server token record.
+The data preparation and launcher are documented in
+`examples/swe-rebench-ash/README.md`; keep this message-based training path
+separate from the exact-token TITO contract below.
+
 <Warning>
 
 **No VLM support yet.** Currently the TITO session path cannot carry image or video inputs. For vision-language models, use the

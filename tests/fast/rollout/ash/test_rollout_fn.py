@@ -73,6 +73,32 @@ def _group():
     ]
 
 
+def test_v2_retains_legacy_default_call_budgets():
+    args = _args()
+    del args.ash_rollout_max_model_calls
+    del args.ash_rollout_max_tool_calls
+    fn = AshRolloutFn(RolloutFnConstructorInput(args=args, data_source=None))
+    request, _ = fn._build_request(group=_group(), rollout_id=0, weight_version=7)
+    assert request.budgets.max_model_calls == request.budgets.max_tool_calls == 100
+
+
+def test_v2_preserves_explicit_unbounded_call_budgets():
+    fn = AshRolloutFn(
+        RolloutFnConstructorInput(
+            args=_args(ash_rollout_max_model_calls=None, ash_rollout_max_tool_calls=None),
+            data_source=None,
+        )
+    )
+    request, _ = fn._build_request(group=_group(), rollout_id=0, weight_version=7)
+    assert request.budgets.max_model_calls is None
+    assert request.budgets.max_tool_calls is None
+
+
+def test_v2_rejects_the_v3_turn_limit_flag():
+    with pytest.raises(ValueError, match="requires AshMessageRolloutFn"):
+        AshRolloutFn(RolloutFnConstructorInput(args=_args(ash_rollout_max_turns=2), data_source=None))
+
+
 def _trajectory(slot, *, token, include_log_probs):
     span = {
         "response_id": f"response-{slot['sample_index']}",
@@ -555,7 +581,7 @@ def test_rollout_fn_tokenizes_text_messages_with_empty_multimodal_placeholders(m
 
     monkeypatch.setattr("miles.rollout.ash.rollout_fn.load_tokenizer", lambda *_args, **_kwargs: FakeTokenizer())
     monkeypatch.setattr(
-        "miles.rollout.ash.rollout_fn.chat_template_utils.apply_chat_template",
+        "miles.utils.chat_template_utils.apply_chat_template",
         fake_apply_chat_template,
     )
     group = _group()

@@ -157,7 +157,7 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
         if args.offload_train:
-            if (x := args.train_memory_margin_bytes) > 0:
+            if (x := args.train_memory_margin_bytes) >= 0:
                 # --train-memory-margin-bytes can tune this
                 logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
                 torch_memory_saver.memory_margin_bytes = x
