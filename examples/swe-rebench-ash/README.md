@@ -84,9 +84,11 @@ unsupported native content fail export explicitly.
 
 The driver allocates independent samples by default. With a compatible Ash driver
 and configured reviewer, add `--ash-rollout-branching --n-samples-per-prompt 2`
-to the training arguments. Ash runs one root, grades it, and performs up to two
-review-guided branch rounds: failed roots seek a positive example, successful
-roots seek a negative example. It returns the root and selected child, with hints
+to the training arguments. Ash runs one root and grades it. Failed roots receive
+up to two review rounds with 4/3-child caps; a successful root receives one round
+with at most 2 children seeking negatives. The reviewer chooses counts and points.
+Each selected round completes grading before mixed rewards stop further rounds.
+Ash returns the root and selected child, with hints
 removed and lineage retained. Each returned sample occupies an allocated slot;
 incomplete pairs are rejected. Shared-prefix credit/weighting is unchanged.
 

@@ -331,8 +331,8 @@ def test_branching_requires_a_fixed_pair(count):
         ))
 
 
-@pytest.mark.parametrize("root_reward", [0.0, 1.0])
-def test_branching_request_and_opposite_pair_import(mask_generator, root_reward):
+@pytest.mark.parametrize("root_reward,search_branches", [(0.0, 4), (0.0, 7), (1.0, 2)])
+def test_branching_request_and_opposite_pair_import(mask_generator, root_reward, search_branches):
     sent, deleted = [], []
 
     def handler(request):
@@ -352,7 +352,10 @@ def test_branching_request_and_opposite_pair_import(mask_generator, root_reward)
             })
         body = payload()
         child = deepcopy(body["trajectories"][0])
-        body.update(rollout_job_id=sent[0]["rollout_job_id"], max_samples=2, actual_samples=2, search_branches=1)
+        body.update(
+            rollout_job_id=sent[0]["rollout_job_id"], max_samples=2, actual_samples=2,
+            search_branches=search_branches,
+        )
         body["trajectories"].append(child)
         for i, trajectory in enumerate(body["trajectories"]):
             trajectory.update(
@@ -378,6 +381,7 @@ def test_branching_request_and_opposite_pair_import(mask_generator, root_reward)
 
     samples, _result = asyncio.run(run())
     assert len(deleted) == 1 and len(samples) == 2
+    assert _result.search_branches == search_branches
     assert [sample.reward for sample in samples] == [root_reward, 1.0 - root_reward]
     assert samples[1].metadata["ash_rollout"]["parent_branch_id"] == "root"
     assert all(sample.rollout_log_probs is None and any(sample.loss_mask) for sample in samples)

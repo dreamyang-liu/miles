@@ -40,12 +40,14 @@ shared-prefix credit assignment.
 
 With a compatible Ash driver and configured reviewer, set
 `--ash-rollout-branching --n-samples-per-prompt 2`. Ash runs and grades one root
-per prompt, then reviews failed roots to seek a resolved child and successful
-roots to seek an unresolved child. Its default limit is two rounds with one
-branch per round, stopping on the first opposite signal.
+per prompt. Failed roots receive up to two review rounds capped at 4 and 3
+children; already successful roots receive one round capped at 2 children seeking
+negative examples. The reviewer chooses the actual count and branch points.
+Every selected child in a round is executed and graded before checking whether
+the root and children include both rewards and another round should be skipped.
 
 Ash returns the root and selected child as a fixed pair. Intermediate attempts
-remain in Ash's execution records. If both children have the root's reward, the
+remain in Ash's execution records. If no child has the opposite reward, the
 last child is selected. Missing recovery points or invalid execution can leave
 an incomplete pair; Miles rejects that shortfall rather than padding samples.
 Prompts progress independently.
