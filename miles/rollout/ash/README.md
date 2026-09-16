@@ -57,6 +57,17 @@ and recomputes logprobs as for ordinary v3 samples; this does not introduce
 tree-specific weighting. The flag defaults off and is omitted from the wire
 when disabled, preserving compatibility with existing v3 drivers.
 
+Live single-LoRA training routes native requests as `base-model:miles_lora`,
+so the server must have the synced adapter registered. Use
+`--ash-rollout-max-sequence-tokens N` with a matching Ash tokenizer configuration
+to require a bounded complete message/snapshot prefix; Miles rejects over-limit
+returns. `--ash-rollout-truncated-reward-scale 0.5` discounts correctly graded
+truncated episodes. `--ash-rollout-max-unusable-groups N` permits bounded fresh
+prompt replacements for terminal groups that cannot supply valid samples,
+without duplicating samples or manufacturing rewards. Protocol/configuration
+errors still propagate. Fixed microbatch1 can be preserved by leaving dynamic
+microbatch packing disabled.
+
 ## Exact-token trajectories (v2)
 
 The Ash rollout backend delegates one complete prompt group to an external

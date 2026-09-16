@@ -1,6 +1,8 @@
 """Ash message rollout: Ash owns environments/rewards; Miles owns training tokens."""
 
 import asyncio
+from dataclasses import replace
+import logging
 import math
 import uuid
 
@@ -21,6 +23,14 @@ from miles.rollout.ash.rollout_fn import (
 )
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.processing_utils import load_tokenizer
+from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
+
+
+logger = logging.getLogger(__name__)
+
+
+class UnusableAshGroup(RuntimeError):
+    """A terminal group did not produce a complete, valid training pair."""
 
 
 class AshMessageClient(AshRolloutClient):
@@ -49,6 +59,10 @@ class AshMessageRolloutFn(AshRolloutFn):
         configured_turns = getattr(self._args, "ash_rollout_max_turns", None)
         self._max_turns = 64 if configured_turns is None else configured_turns
         self._finalization_timeout_seconds = getattr(self._args, "ash_rollout_finalization_timeout_seconds", 1800.0)
+        self._max_unusable_groups = getattr(self._args, "ash_rollout_max_unusable_groups", 0)
+        if type(self._max_unusable_groups) is not int or self._max_unusable_groups < 0:
+            raise ValueError("--ash-rollout-max-unusable-groups must be a nonnegative integer")
+        self._discarded_groups = 0
         if not getattr(self._args, "compute_advantages_and_returns", True):
             raise ValueError("Ash message training requires the normal RL forward/advantage path")
         for name in (
@@ -119,6 +133,13 @@ class AshMessageRolloutFn(AshRolloutFn):
             AshSampleSlot(sample_slot_id=f"{job_id}:slot:{sample.index}", sample_index=sample.index)
             for sample in group
         ]
+        model = getattr(self._args, "sglang_served_model_name", None) or getattr(self._args, "model", None)
+        if lora_rollout_enabled(self._args):
+            if not isinstance(model, str) or not model:
+                raise ValueError("Live Ash LoRA requires sglang_served_model_name")
+            if ":" in model:
+                raise ValueError("Configure the base served-model name; Ash adds the active LoRA adapter")
+            model = f"{model}:{LORA_ADAPTER_NAME}"
         request = AshMessageRequest(
             rollout_job_id=job_id,
             rollout_id=rollout_id,
@@ -127,7 +148,7 @@ class AshMessageRolloutFn(AshRolloutFn):
             image=image,
             prompt=prompt,
             model_endpoint=self._model_endpoint(),
-            model=getattr(self._args, "sglang_served_model_name", None) or getattr(self._args, "model", None),
+            model=model,
             sample_slots=slots,
             max_samples=len(slots),
             minimum_returned_samples=len(slots),
@@ -138,10 +159,36 @@ class AshMessageRolloutFn(AshRolloutFn):
                 max_wall_time_seconds=self._rollout_timeout_seconds,
             ),
             branching=getattr(self._args, "ash_rollout_branching", False),
+            max_sequence_tokens=getattr(self._args, "ash_rollout_max_sequence_tokens", None),
+            truncated_reward_scale=getattr(self._args, "ash_rollout_truncated_reward_scale", 1.0),
         )
         return request, dict(zip((slot.sample_slot_id for slot in slots), group, strict=True))
 
+    async def _call_train(self, input):
+        self._discarded_groups = 0
+        output = await super()._call_train(input)
+        return replace(output, metrics={
+            **(output.metrics or {}), "rollout/ash/discarded_groups": self._discarded_groups,
+        })
+
     async def _run_group(self, *, client, group, rollout_id, weight_version):
+        for attempt in range(self._max_unusable_groups + 1):
+            try:
+                return await self._run_attempt(
+                    client=client, group=group, rollout_id=rollout_id, weight_version=weight_version,
+                )
+            except UnusableAshGroup as error:
+                if attempt == self._max_unusable_groups or self._data_source is None:
+                    raise
+                self._discarded_groups += 1
+                logger.warning("Replacing unusable Ash group (%s/%s): %s",
+                               attempt + 1, self._max_unusable_groups, error)
+                replacements = self._data_source.get_samples(1)
+                if len(replacements) != 1:
+                    raise RuntimeError("No replacement prompt group available") from error
+                group = replacements[0]
+
+    async def _run_attempt(self, *, client, group, rollout_id, weight_version):
         request, slots = self._build_request(group=group, rollout_id=rollout_id, weight_version=weight_version)
         try:
             acknowledgement = await client.submit(request)
@@ -158,9 +205,11 @@ class AshMessageRolloutFn(AshRolloutFn):
             ):
                 raise ValueError("Ash message result identity/slot count mismatch")
             if result.status not in {"completed", "early_stopped"}:
+                if result.status == "failed":
+                    raise UnusableAshGroup(f"Ash message rollout failed: {result.stop_reason}")
                 raise RuntimeError(f"Ash message rollout failed: {result.stop_reason}")
             if result.actual_samples != request.max_samples:
-                raise ValueError("Ash must return all allocated samples for fixed-size training groups")
+                raise UnusableAshGroup("Ash did not return all allocated samples for the fixed-size group")
             if self._mask_generator is None:
                 tokenizer = load_tokenizer(
                     self._args.hf_checkpoint,
@@ -171,6 +220,11 @@ class AshMessageRolloutFn(AshRolloutFn):
                     tokenizer,
                     tokenizer_type=getattr(self._args, "loss_mask_type", "qwen"),
                 )
-            return import_ash_messages(result, slots, self._mask_generator), result
+            samples = import_ash_messages(result, slots, self._mask_generator)
+            if request.max_sequence_tokens is not None and any(
+                len(sample.tokens) > request.max_sequence_tokens for sample in samples
+            ):
+                raise ValueError("Ash returned a training sequence above its agreed token limit")
+            return samples, result
         finally:
             await _delete_without_masking_error(client, request.rollout_job_id)

@@ -611,6 +611,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "and a configured Ash reviewer; returns the root and a selected branch."
                 ),
             )
+            parser.add_argument(
+                "--ash-rollout-max-sequence-tokens", type=int, default=None,
+                help="V3: cap the full cleaned trajectory at a paired message/snapshot boundary.",
+            )
+            parser.add_argument(
+                "--ash-rollout-truncated-reward-scale", type=float, default=1.0,
+                help="V3: multiply a truly graded truncated trajectory reward by this factor.",
+            )
+            parser.add_argument(
+                "--ash-rollout-max-unusable-groups", type=int, default=0,
+                help="V3: bounded replacement prompts per failed training group; never pad or invent rewards.",
+            )
             parser.set_defaults(
                 _ash_rollout_max_model_calls_explicit=False,
                 _ash_rollout_max_tool_calls_explicit=False,

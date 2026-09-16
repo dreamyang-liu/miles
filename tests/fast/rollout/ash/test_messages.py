@@ -14,7 +14,7 @@ from transformers import PreTrainedTokenizerFast
 
 from miles.rollout.ash.message_importer import import_ash_messages
 from miles.rollout.ash.message_protocol import AshMessageRequest, AshMessageResult
-from miles.rollout.ash.message_rollout import AshMessageClient, AshMessageRolloutFn
+from miles.rollout.ash.message_rollout import AshMessageClient, AshMessageRolloutFn, UnusableAshGroup
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.types import Sample
@@ -308,6 +308,74 @@ def test_unset_output_limit_leaves_native_default():
     fn = AshMessageRolloutFn(RolloutFnConstructorInput(args=args(rollout_max_response_len=None), data_source=None))
     request, _ = fn._build_request(group=group(), rollout_id=1, weight_version=7)
     assert "max_new_tokens" not in request.sampling_params
+
+
+@pytest.mark.parametrize("train_only,expected", [(False, "policy:miles_lora"), (True, "policy")])
+def test_live_lora_uses_explicit_native_adapter_model(train_only, expected):
+    fn = AshMessageRolloutFn(RolloutFnConstructorInput(args=args(
+        lora_rank=32, lora_train_only=train_only, sglang_served_model_name="policy",
+        ash_rollout_max_sequence_tokens=81920, ash_rollout_truncated_reward_scale=0.5,
+    ), data_source=None))
+    request, _ = fn._build_request(group=group(), rollout_id=1, weight_version=7)
+    assert request.model == expected
+    assert request.to_wire()["max_sequence_tokens"] == 81920
+    assert request.to_wire()["truncated_reward_scale"] == 0.5
+
+
+def test_sequence_truncation_reward_and_reason_survive_import(mask_generator):
+    body = payload()
+    body["trajectories"][0].update(status="truncated", stop_reason="max_sequence_tokens", reward=0.5)
+    (sample,) = import_ash_messages(AshMessageResult.model_validate(body), {"slot": group()[0]}, mask_generator)
+    assert sample.reward == 0.5 and sample.status == Sample.Status.TRUNCATED
+    assert sample.metadata["ash_rollout"]["stop_reason"] == "max_sequence_tokens"
+
+
+def test_unusable_group_is_replaced_with_a_new_prompt_without_padding():
+    replacement = deepcopy(group())
+    replacement[0].index = 99
+    replacement[0].group_index = 4
+
+    class Data:
+        calls = 0
+
+        def get_samples(self, count):
+            self.calls += 1
+            assert count == 1 and self.calls == 1
+            return [replacement]
+
+    data = Data()
+    fn = AshMessageRolloutFn(RolloutFnConstructorInput(
+        args=args(ash_rollout_max_unusable_groups=1), data_source=data,
+    ))
+    seen = []
+
+    async def attempt(**kwargs):
+        seen.append(kwargs["group"][0].index)
+        if len(seen) == 1:
+            raise UnusableAshGroup("no available recovery point")
+        return kwargs["group"], None
+
+    fn._run_attempt = attempt
+    samples, _ = asyncio.run(fn._run_group(client=None, group=group(), rollout_id=0, weight_version=0))
+    assert seen == [11, 99] and samples[0].group_index == 4
+    assert fn._discarded_groups == 1
+
+
+def test_protocol_errors_are_not_hidden_by_prompt_replacement():
+    class Data:
+        def get_samples(self, count):
+            pytest.fail("Protocol errors must not consume replacement prompts")
+
+    fn = AshMessageRolloutFn(RolloutFnConstructorInput(
+        args=args(ash_rollout_max_unusable_groups=8), data_source=Data(),
+    ))
+
+    async def attempt(**kwargs):
+        raise ValueError("result identity mismatch")
+
+    fn._run_attempt = attempt
+    with pytest.raises(ValueError, match="identity mismatch"):
+        asyncio.run(fn._run_group(client=None, group=group(), rollout_id=0, weight_version=0))
 
 
 def test_branching_off_preserves_the_old_wire_and_real_cli_defaults():

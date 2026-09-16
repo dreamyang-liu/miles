@@ -45,11 +45,17 @@ class AshMessageRequest(FrozenStrictBaseModel):
     sampling_params: dict[str, Any] = Field(default_factory=dict)
     budgets: AshMessageBudget
     branching: bool = Field(default=False, strict=True)
+    max_sequence_tokens: int | None = Field(default=None, strict=True, gt=1024)
+    truncated_reward_scale: float = Field(default=1.0, strict=True, ge=0, le=1, allow_inf_nan=False)
 
     def to_wire(self) -> dict[str, Any]:
         value = self.model_dump(mode="json")
         if not self.branching:
             del value["branching"]
+        if self.max_sequence_tokens is None:
+            del value["max_sequence_tokens"]
+        if self.truncated_reward_scale == 1.0:
+            del value["truncated_reward_scale"]
         return value
 
     @model_validator(mode="after")
@@ -66,7 +72,7 @@ class AshMessageTrajectory(FrozenStrictBaseModel):
     tools: list[dict[str, Any]] = Field(default_factory=list)
     reward: StrictNumber | dict[str, Any]
     status: AshTrajectoryStatus
-    stop_reason: Literal["max_turns_reached", "timeout"] | None = None
+    stop_reason: Literal["max_turns_reached", "timeout", "max_sequence_tokens"] | None = None
     hints_removed: Literal[True]
     metadata: dict[str, Any] = Field(default_factory=dict)
 
