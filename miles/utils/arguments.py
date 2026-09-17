@@ -612,6 +612,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--ash-rollout-branching-return-mode", choices=["pair", "all"], default="pair",
+                help="V3: return a fixed root/branch pair, or all valid graded trajectories. Match the Ash deployment.",
+            )
+            parser.add_argument(
+                "--ash-rollout-loss-weighting", choices=["task", "trajectory"], default="task",
+                help="V3 all mode: equal weight per task, or equal weight per returned trajectory.",
+            )
+            parser.add_argument(
                 "--ash-rollout-max-sequence-tokens", type=int, default=None,
                 help="V3: cap the full cleaned trajectory at a paired message/snapshot boundary.",
             )
@@ -3335,12 +3343,18 @@ def miles_validate_args(args):
     # 2. multi-LoRA (auto-enabled, no compaction/subagent): the per-round sample count is
     #    a config-shaped multiple of dp_size trained as exactly one step on the legacy
     #    training-side schedule; static micro-batching stays valid there.
-    if args.use_dynamic_global_batch_size and not args.multi_lora:
+    variable_ash = (
+        getattr(args, "ash_rollout_branching", False)
+        and getattr(args, "ash_rollout_branching_return_mode", "pair") == "all"
+    )
+    if args.use_dynamic_global_batch_size and not args.multi_lora and not variable_ash:
         assert args.use_dynamic_batch_size, (
             "--use-dynamic-global-batch-size requires --use-dynamic-batch-size (with --max-tokens-per-gpu): "
             "static micro-batching cannot guarantee dp_size * mb_group alignment when the physical sample count "
             "is data-dependent; this configuration is not supported."
         )
+    # All-trajectory Ash batches validate DP1/VPP1 at collection time and use
+    # the rollout-side schedule, whose final static microbatch may be smaller.
 
     if getattr(args, "balance_by_flops", False):
         assert args.use_dynamic_batch_size, "--balance-by-flops requires --use-dynamic-batch-size"

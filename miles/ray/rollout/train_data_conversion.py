@@ -36,6 +36,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_mask_sums": ValueSpec(codec="ndarray", dtype="int64"),
+    "sample_loss_weights": ValueSpec(codec="ndarray", dtype="float32"),
     "multimodal_train_inputs": ValueSpec(codec="ragged_tensor_dict"),
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
@@ -101,6 +102,13 @@ def convert_samples_to_train_data(
     train_data["loss_masks"] = loss_masks
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
+    if (
+        getattr(args, "ash_rollout_branching_return_mode", "pair") == "all"
+        and getattr(args, "ash_rollout_loss_weighting", "task") == "task"
+    ):
+        if args.calculate_per_token_loss:
+            raise ValueError("Task-equal Ash loss requires per-trajectory means")
+        train_data["sample_loss_weights"] = _task_equal_loss_weights(samples)
 
     # overwriting the raw reward
     if samples[0].metadata and "raw_reward" in samples[0].metadata:
@@ -178,6 +186,17 @@ def convert_samples_to_train_data(
         train_data["dynamic_global_batch_size"] = x
 
     return train_data
+
+
+def _task_equal_loss_weights(samples: list[Sample]) -> list[float]:
+    """After the learner divides by N, every task contributes 1 / task_count."""
+    counts: dict[int, int] = {}
+    for sample in samples:
+        if sample.group_index is None:
+            raise ValueError("Task-equal loss requires a prompt group index on every trajectory")
+        counts[sample.group_index] = counts.get(sample.group_index, 0) + 1
+    total = len(samples)
+    return [total / (len(counts) * counts[sample.group_index]) for sample in samples]
 
 
 def _compute_rollout_mask_sums(rollout_ids: list[int], loss_masks: list[list[int]]) -> list[int]:
@@ -386,6 +405,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "sample_indices",
             "rollout_ids",
             "rollout_mask_sums",
+            "sample_loss_weights",
             "rollout_log_probs",
             "rollout_sampling_mask_ids",
             "rollout_sampling_mask_offsets",

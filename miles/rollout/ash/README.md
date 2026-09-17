@@ -426,9 +426,41 @@ cancelled terminal result after that server-side deadline; it does not extend
 the rollout budget. HTTP request timeout and polling cadence are configured
 separately.
 
-## Current scope
+## Variable trajectory counts with messages-v3 branching
 
-The current protocol supports training rollout with a fixed number of
+The message rollout can collect a fixed number of tasks while retaining every
+valid graded root and branch. Configure the dedicated Ash driver with
+`miles.branching.return_mode=all` and enough `miles.max_samples` for the full
+branch schedule. For widths4/3, each task reserves8 slots:
+
+```bash
+--rollout-function-path miles.rollout.ash.message_rollout.AshMessageRolloutFn \
+--ash-rollout-branching \
+--ash-rollout-branching-return-mode all \
+--rollout-batch-size 8 \
+--n-samples-per-prompt 8 \
+--global-batch-size 64 \
+--use-dynamic-global-batch-size \
+--micro-batch-size 2 \
+--ash-rollout-loss-weighting task
+```
+
+Here64 is only the nominal slot budget. If the eight tasks return23 valid
+trajectories, the learner performs one update over all23 using12 microbatches,
+the last containing one trajectory. No unused slot becomes a training sample;
+trajectories are neither trimmed nor duplicated to fill a batch.
+The current implementation requires DP1 and VPP1 and a rollout-side schedule.
+
+GRPO reward normalization stays within each task's actual family. The default
+`task` weighting gives each task equal loss weight and splits that weight
+equally among its trajectories. `trajectory` instead gives every trajectory
+equal weight. Per-token loss normalization is not supported in this mode.
+Incomplete execution/export/grading results never become negative rewards.
+The default `pair` mode retains the original two-trajectory contract.
+
+## Current v2 scope
+
+The v2 protocol supports training rollout with a fixed number of
 returned samples equal to `n_samples_per_prompt`. Evaluation, multimodal
 prompts, and early return with fewer samples are not yet supported. Environment
 selection is per prompt group; each sample in the group must carry the same

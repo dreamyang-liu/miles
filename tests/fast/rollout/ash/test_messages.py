@@ -456,6 +456,63 @@ def test_branching_request_and_opposite_pair_import(mask_generator, root_reward,
     assert len({sample.index for sample in samples}) == 2
 
 
+@pytest.mark.parametrize("actual_count", [1, 3, 8])
+def test_all_branching_imports_only_actual_graded_trajectories(mask_generator, actual_count):
+    sent, deleted = [], []
+
+    def handler(request):
+        if request.method == "POST":
+            body = json.loads(request.content)
+            sent.append(body)
+            assert body["branching"] and body["max_samples"] == 8
+            assert body["minimum_returned_samples"] == 1
+            return httpx.Response(202, json={
+                "protocol_version": "ash-rollout-v3", "rollout_job_id": body["rollout_job_id"], "status": "queued",
+            })
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            return httpx.Response(200, json={
+                "protocol_version": "ash-rollout-v3", "rollout_job_id": sent[0]["rollout_job_id"], "status": "completed",
+            })
+        body = payload()
+        template = body["trajectories"][0]
+        body.update(rollout_job_id=sent[0]["rollout_job_id"], max_samples=8, actual_samples=actual_count)
+        body["trajectories"] = [
+            {
+                **deepcopy(template), "sample_slot_id": sent[0]["sample_slots"][i]["sample_slot_id"],
+                "branch_id": f"branch-{i}", "parent_branch_id": None if i == 0 else "branch-0",
+                "reward": float(i % 2),
+            }
+            for i in range(actual_count)
+        ]
+        return httpx.Response(200, json=body)
+
+    async def run():
+        fn = AshMessageRolloutFn(RolloutFnConstructorInput(
+            args=args(
+                ash_rollout_branching=True, ash_rollout_branching_return_mode="all",
+                use_dynamic_global_batch_size=True, n_samples_per_prompt=8,
+            ),
+            data_source=None,
+        ))
+        fn._mask_generator = mask_generator
+        allocated = [deepcopy(group()[0]) for _ in range(8)]
+        for i, sample in enumerate(allocated):
+            sample.index += i
+        async with AshMessageClient(
+            "http://ash", client=httpx.AsyncClient(base_url="http://ash", transport=httpx.MockTransport(handler)),
+        ) as client:
+            return await fn._run_group(client=client, group=allocated, rollout_id=1, weight_version=7)
+
+    samples, _ = asyncio.run(run())
+    assert len(deleted) == 1
+    assert len(samples) == actual_count
+    assert len({sample.index for sample in samples}) == actual_count
+    assert {sample.group_index for sample in samples} == {3}
+    assert [sample.reward for sample in samples] == [float(i % 2) for i in range(actual_count)]
+    assert all(sample.rollout_log_probs is None and any(sample.loss_mask) for sample in samples)
+
+
 @pytest.mark.parametrize("group_size", [1, 2, 8])
 def test_turn_limit_is_per_trajectory_and_wire_has_no_call_budgets(group_size):
     samples = [

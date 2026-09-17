@@ -168,6 +168,7 @@ def loss_function(
         args.qkv_format,
         batch.get("max_seq_lens", None),
         denominators=batch.get("rollout_mask_sums", None),
+        sample_weights=batch.get("sample_loss_weights", None),
     )
 
     func = get_loss_function(args)

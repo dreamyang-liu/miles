@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class UnusableAshGroup(RuntimeError):
-    """A terminal group did not produce a complete, valid training pair."""
+    """A terminal group did not produce the requested valid trajectories."""
 
 
 class AshMessageClient(AshRolloutClient):
@@ -96,7 +96,17 @@ class AshMessageRolloutFn(AshRolloutFn):
         branching = getattr(self._args, "ash_rollout_branching", False)
         if type(branching) is not bool:
             raise ValueError("--ash-rollout-branching must be boolean")
-        if branching and self._args.n_samples_per_prompt != 2:
+        return_mode = getattr(self._args, "ash_rollout_branching_return_mode", "pair")
+        if return_mode not in {"pair", "all"}:
+            raise ValueError("--ash-rollout-branching-return-mode must be pair or all")
+        if getattr(self._args, "ash_rollout_loss_weighting", "task") not in {"task", "trajectory"}:
+            raise ValueError("--ash-rollout-loss-weighting must be task or trajectory")
+        if return_mode == "all":
+            if not branching or not getattr(self._args, "use_dynamic_global_batch_size", False):
+                raise ValueError("All-trajectory branching requires branching and dynamic global batch size")
+            if getattr(self._args, "calculate_per_token_loss", False):
+                raise ValueError("All-trajectory Ash batches currently require per-trajectory loss means")
+        elif branching and self._args.n_samples_per_prompt != 2:
             raise ValueError("--ash-rollout-branching requires --n-samples-per-prompt 2")
         for name in ("ash_rollout_max_model_calls", "ash_rollout_max_tool_calls"):
             explicit = getattr(self._args, f"_{name}_explicit", None)
@@ -151,7 +161,9 @@ class AshMessageRolloutFn(AshRolloutFn):
             model=model,
             sample_slots=slots,
             max_samples=len(slots),
-            minimum_returned_samples=len(slots),
+            minimum_returned_samples=(
+                1 if getattr(self._args, "ash_rollout_branching_return_mode", "pair") == "all" else len(slots)
+            ),
             max_turns=self._max_turns,
             finalization_timeout_seconds=self._finalization_timeout_seconds,
             sampling_params=dict(self._sampling_params),
@@ -167,8 +179,19 @@ class AshMessageRolloutFn(AshRolloutFn):
     async def _call_train(self, input):
         self._discarded_groups = 0
         output = await super()._call_train(input)
+        group_sizes = [len(group) for group in output.samples]
         return replace(output, metrics={
             **(output.metrics or {}), "rollout/ash/discarded_groups": self._discarded_groups,
+            "rollout/ash/task_count": len(group_sizes),
+            "rollout/ash/trajectory_count": sum(group_sizes),
+            "rollout/ash/min_task_trajectories": min(group_sizes),
+            "rollout/ash/max_task_trajectories": max(group_sizes),
+            "rollout/ash/tasks_with_positive_reward": sum(
+                any(sample.reward > 0 for sample in group) for group in output.samples
+            ),
+            "rollout/ash/tasks_with_mixed_rewards": sum(
+                len({sample.reward for sample in group}) > 1 for group in output.samples
+            ),
         })
 
     async def _run_group(self, *, client, group, rollout_id, weight_version):
@@ -208,8 +231,10 @@ class AshMessageRolloutFn(AshRolloutFn):
                 if result.status == "failed":
                     raise UnusableAshGroup(f"Ash message rollout failed: {result.stop_reason}")
                 raise RuntimeError(f"Ash message rollout failed: {result.stop_reason}")
-            if result.actual_samples != request.max_samples:
+            if request.minimum_returned_samples == request.max_samples and result.actual_samples != request.max_samples:
                 raise UnusableAshGroup("Ash did not return all allocated samples for the fixed-size group")
+            if not request.minimum_returned_samples <= result.actual_samples <= request.max_samples:
+                raise UnusableAshGroup("Ash returned fewer valid trajectories than required")
             if self._mask_generator is None:
                 tokenizer = load_tokenizer(
                     self._args.hf_checkpoint,

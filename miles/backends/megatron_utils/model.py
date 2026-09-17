@@ -836,6 +836,12 @@ def train(
             role_tag = "" if role == "actor" else f"{role}-"
 
             extra_metrics = {}
+            if getattr(args, "ash_rollout_branching_return_mode", "pair") == "all":
+                extra_metrics.update(
+                    task_count=args.rollout_batch_size,
+                    trajectory_count=num_rollouts[step_id],
+                    microbatches=num_microbatches[step_id],
+                )
             if args.enable_mtp_training and mtp_losses is not None:
                 extra_metrics["mtp_loss"] = mtp_losses
 

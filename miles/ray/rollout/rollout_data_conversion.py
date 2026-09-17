@@ -1,6 +1,7 @@
 import itertools
 import logging
 
+from miles.utils.dp_schedule import has_full_schedule_config
 from miles.utils.multi_lora import is_multi_lora_enabled
 from miles.utils.types import Sample
 
@@ -24,6 +25,9 @@ def postprocess_rollout_data(args, data, train_parallel_config):
     # flatten the data if it is a list of lists
     while isinstance(data[0], list):
         data = list(itertools.chain.from_iterable(data))
+
+    if getattr(args, "ash_rollout_branching_return_mode", "pair") == "all":
+        return _prepare_variable_ash_batch(args, data, train_parallel_config)
 
     # Compact rollouts must not be trimmed by sample count; the schedule drops
     # whole trailing rollouts instead.
@@ -49,6 +53,35 @@ def postprocess_rollout_data(args, data, train_parallel_config):
         logger.info(f"Final collected {len(data)} samples from rollout to train")
 
     return data, metadata
+
+
+def _prepare_variable_ash_batch(args, samples, train_parallel_config):
+    """Keep every valid trajectory and one update for a complete task batch."""
+    if not args.use_dynamic_global_batch_size:
+        raise ValueError("All-trajectory Ash batches require dynamic global batch size")
+    if not has_full_schedule_config(train_parallel_config):
+        raise ValueError("All-trajectory Ash batches require the rollout-side microbatch scheduler")
+    if train_parallel_config["dp_size"] != 1 or (train_parallel_config["vpp_size"] or 1) != 1:
+        raise ValueError("All-trajectory Ash batches currently require DP1 and VPP1 to avoid dropping trajectories")
+    if is_multi_lora_enabled(args):
+        raise ValueError("All-trajectory Ash batches currently support one LoRA adapter")
+    if any(sample.group_index is None or sample.index is None or sample.rollout_id is not None for sample in samples):
+        raise ValueError("Ash trajectories need unique sample indices and prompt group indices, not compact-rollout IDs")
+    if len({sample.index for sample in samples}) != len(samples):
+        raise ValueError("Ash returned duplicate sample indices")
+    groups = {}
+    for sample in samples:
+        groups.setdefault(sample.group_index, []).append(sample)
+    if len(groups) != args.rollout_batch_size:
+        raise ValueError(f"Expected {args.rollout_batch_size} Ash tasks, received {len(groups)}")
+    metadata = {
+        "dynamic_global_batch_size": len(samples),
+        "ash_task_count": len(groups),
+        "ash_task_trajectory_counts": {str(group): len(values) for group, values in groups.items()},
+    }
+    logger.info("Ash task batch: tasks=%s trajectories=%s counts=%s; no trimming",
+                len(groups), len(samples), metadata["ash_task_trajectory_counts"])
+    return samples, metadata
 
 
 def validate_compact_rollout_ids(node, depth=0):

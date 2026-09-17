@@ -104,12 +104,17 @@ def get_sum_of_sample_mean(
     max_seq_lens: list[int] | None = None,
     *,
     denominators: list[torch.Tensor] | torch.Tensor | None = None,
+    sample_weights: list[float] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP; ``denominators`` overrides each
     sample's own ``loss_mask.sum()`` (e.g. pass ``rollout_mask_sums`` for
     per-rollout means)."""
     if denominators is None:
         denominators = [m.sum() for m in loss_masks]
+    # Preserve the true mask counts in the denominator, then weight each
+    # trajectory's numerator. Do not mutate the batch's binary loss masks.
+    if sample_weights is not None:
+        loss_masks = [mask * weight for mask, weight in zip(loss_masks, sample_weights, strict=True)]
 
     parallel_state = get_parallel_state()
     cp_size = parallel_state.cp.size
