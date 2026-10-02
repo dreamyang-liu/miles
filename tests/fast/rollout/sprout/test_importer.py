@@ -93,14 +93,56 @@ def test_unknown_slot_and_unfinished_group_are_rejected(mask_generator):
         import_trajectories(RolloutResult.model_validate(body), slots(group()), mask_generator)
 
 
-def test_step_loss_mask_on_a_message_keeps_it_as_context_only(mask_generator):
-    """A message marked ``step_loss_mask: 0`` is rendered but not trained: how a
-    branch's copied prefix or an inserted repair turn stays out of the loss."""
+def branch_body():
+    """A branch trajectory: the parent's restored turn, an inserted turn, then the policy's own."""
     body = sprout_result()
-    messages = body["trajectories"][0]["messages"]
-    messages[1]["step_loss_mask"] = 0
-    messages.insert(3, {"role": "assistant", "content": "inspect", "step_loss_mask": 0})
-    (sample,) = import_trajectories(RolloutResult.model_validate(body), slots(group()), mask_generator)
+    body["trajectories"][0]["messages"] = [
+        {"role": "user", "content": "fix task"},
+        {"role": "assistant", "content": "inspect", "tool_calls": [
+            {"id": "parent-1", "type": "function", "function": {"name": "shell", "arguments": '{"command":"pwd"}'}}]},
+        {"role": "tool", "tool_call_id": "parent-1", "content": "/workspace"},
+        {"role": "assistant", "content": "hint", "tool_calls": [
+            {"id": "inserted-1", "type": "function", "function": {"name": "shell", "arguments": '{"command":"ls"}'}}]},
+        {"role": "tool", "tool_call_id": "inserted-1", "content": "tests"},
+        {"role": "assistant", "content": "fixed"},
+    ]
+    body["trajectories"][0]["parent_branch_id"] = "parent-job"
+    body["trajectories"][0]["metadata"]["provenance"] = {"prefix_messages": 3, "inserted_messages": [3]}
+    return body
+
+
+def test_a_branch_trains_only_what_its_policy_sampled(mask_generator):
+    """The restored prefix and the inserted turn are rendered as context and kept
+    out of the loss; the turn the policy produced after them is the target."""
+    (sample,) = import_trajectories(RolloutResult.model_validate(branch_body()), slots(group()), mask_generator)
     trained = trained_text(mask_generator, sample)
-    assert "fixed" in trained and "inspect" not in trained
-    assert "inspect" in mask_generator.tokenizer.decode(sample.tokens)
+    assert "fixed" in trained
+    assert "inspect" not in trained and "hint" not in trained
+    context = mask_generator.tokenizer.decode(sample.tokens)
+    assert "inspect" in context and "hint" in context and "tests" in context
+    assert [message.get("step_loss_mask") for message in sample.metadata["messages"]] == [0, 0, 0, 0, None, None]
+
+
+@pytest.mark.parametrize("provenance, message", [
+    (None, "say which of its messages"),
+    ({"prefix_messages": 0}, "say which of its messages"),
+    ({"prefix_messages": 7, "inserted_messages": []}, "prefix_messages"),
+    ({"prefix_messages": 0, "inserted_messages": [2]}, "index assistant messages"),
+    ({"prefix_messages": 0, "inserted_messages": [9]}, "index assistant messages"),
+])
+def test_a_trajectory_must_say_which_messages_the_policy_sampled(mask_generator, provenance, message):
+    body = branch_body()
+    metadata = body["trajectories"][0]["metadata"]
+    if provenance is None:
+        del metadata["provenance"]
+    else:
+        metadata["provenance"] = provenance
+    with pytest.raises(ValueError, match=message):
+        import_trajectories(RolloutResult.model_validate(body), slots(group()), mask_generator)
+
+
+def test_a_branch_whose_own_turns_are_all_unsampled_has_nothing_to_train(mask_generator):
+    body = branch_body()
+    body["trajectories"][0]["metadata"]["provenance"] = {"prefix_messages": 3, "inserted_messages": [3, 5]}
+    with pytest.raises(ValueError, match="no trainable assistant tokens"):
+        import_trajectories(RolloutResult.model_validate(body), slots(group()), mask_generator)

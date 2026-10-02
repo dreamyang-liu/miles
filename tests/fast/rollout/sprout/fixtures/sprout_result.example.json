@@ -48,6 +48,10 @@
         "source_image": "prime/primeintellect/task:base",
         "graded_snapshot_id": "ABC",
         "origin": {},
+        "provenance": {
+          "prefix_messages": 0,
+          "inserted_messages": []
+        },
         "logprob_context": "hint_free_messages"
       }
     }

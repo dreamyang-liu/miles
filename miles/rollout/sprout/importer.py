@@ -87,6 +87,29 @@ def prepare_messages(trajectory: Trajectory) -> list[dict]:
     return messages
 
 
+def unsampled_messages(trajectory: Trajectory) -> set[int]:
+    """Indices of the messages no policy sampled in this trajectory, from Sprout's provenance.
+
+    A branch restores its parent's history (``prefix_messages``) and may insert
+    an assistant turn written outside the actor (``inserted_messages``). Both
+    stay in the context the trainer scores, but neither is the policy's output
+    to learn from.
+    """
+    provenance = trajectory.metadata.get("provenance")
+    if not isinstance(provenance, dict) or set(provenance) != {"prefix_messages", "inserted_messages"}:
+        raise ValueError("a Sprout trajectory must say which of its messages the policy sampled")
+    prefix, inserted = provenance["prefix_messages"], provenance["inserted_messages"]
+    count = len(trajectory.messages)
+    if type(prefix) is not int or not 0 <= prefix <= count:
+        raise ValueError("provenance prefix_messages is not a message count of this trajectory")
+    if not isinstance(inserted, list) or any(
+        type(index) is not int or not 0 <= index < count or trajectory.messages[index].get("role") != "assistant"
+        for index in inserted
+    ):
+        raise ValueError("provenance inserted_messages must index assistant messages of this trajectory")
+    return set(range(prefix)) | set(inserted)
+
+
 def _import_trajectory(
     result: RolloutResult,
     trajectory: Trajectory,
@@ -95,6 +118,9 @@ def _import_trajectory(
     weight_version: int | None,
 ) -> Sample:
     messages = prepare_messages(trajectory)
+    for index in unsampled_messages(trajectory):
+        # Rendered as context, excluded from the loss (MultiTurnLossMaskGenerator).
+        messages[index]["step_loss_mask"] = 0
     token_ids, full_mask = mask_generator.get_loss_mask(messages, tools=trajectory.tools or None)
     if len(token_ids) != len(full_mask) or not any(full_mask):
         raise ValueError("the rendered trajectory has no trainable assistant tokens")
