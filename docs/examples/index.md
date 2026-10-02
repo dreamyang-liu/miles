@@ -20,6 +20,7 @@ End-to-end training workflows — the place to start.
 - **[ppo](/examples/ppo)**: Actor-critic PPO with GAE advantages, where the critic shares the actor's train GPUs.
 - **[retool_v2](/examples/retool-v2)**: Tool-enabled language model generation with sandboxed Python code execution interleaved with thinking.
 - **[swe-agent-harbor-docker](/examples/swe-agent-harbor-docker)**: Trains coding and terminal agents with Harbor-managed local Docker sandboxes and verifier rewards.
+- **[swe-rebench-sprout](/examples/swe-rebench-sprout)**: Standard GRPO on SWE-rebench, with rollouts run, snapshotted and graded by Sprout and trained on as hint-free messages.
 
 ## [Infra Features](/examples/infra-features)
 
