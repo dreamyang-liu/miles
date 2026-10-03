@@ -83,22 +83,45 @@ class MultiTurnLossMaskGenerator:
 
         prefix_message = {"role": "user", "content": "FOR CALCULATING LOSS MASK ONLY"}
         prefix_token_ids = self.tokenizer.apply_chat_template([prefix_message], tokenize=True, return_dict=False)
+        # Rendered on its own, the prefix message carries the template's implicit
+        # system preamble (reasoning instructions, tool directions) before its
+        # body. Trailing a real first message it carries only the body; leading
+        # a later message it carries both, and removing it removes the preamble
+        # too. Stripping `system_message_length` again after that cut real
+        # content: with Qwen3.5's template, 42 tokens from the start of every
+        # message, the opening of each assistant turn's reasoning included.
+        prefix_body_ids = prefix_token_ids[self.system_message_length :]
+        if not prefix_body_ids:
+            raise ValueError("chat template produced an empty prefix message")
 
-        for i, message in enumerate(messages):
+        # Qwen's templates render consecutive tool results inside one user turn;
+        # rendered one by one they would each open a turn of their own, and the
+        # trained sequence would differ from the one the model generated under.
+        # Tool results are never trained, so a run of them is one all-zero chunk.
+        chunks: list[list[dict]] = []
+        for message in messages:
+            if message["role"] == "tool" and chunks and chunks[-1][-1]["role"] == "tool":
+                chunks[-1].append(message)
+            else:
+                chunks.append([message])
+
+        for i, chunk in enumerate(chunks):
             if i == 0:
                 tailed_message_ids = self.tokenizer.apply_chat_template(
-                    [message, prefix_message], tokenize=True, return_dict=False, tools=tools
+                    [*chunk, prefix_message], tokenize=True, return_dict=False, tools=tools
                 )
-                message_ids = tailed_message_ids[: -len(prefix_token_ids)]
+                if tailed_message_ids[-len(prefix_body_ids) :] != prefix_body_ids:
+                    raise ValueError("chat template does not preserve the trailing mask prefix")
+                message_ids = tailed_message_ids[: -len(prefix_body_ids)]
             else:
                 prefixed_message_ids = self.tokenizer.apply_chat_template(
-                    [prefix_message, message], tokenize=True, return_dict=False
+                    [prefix_message, *chunk], tokenize=True, return_dict=False
                 )
+                if prefixed_message_ids[: len(prefix_token_ids)] != prefix_token_ids:
+                    raise ValueError("chat template does not preserve the leading mask prefix")
                 message_ids = prefixed_message_ids[len(prefix_token_ids) :]
 
-            if message["role"] != "system" and i > 0:
-                message_ids = message_ids[self.system_message_length :]
-
+            message = chunk[0]
             if message["role"] == "assistant":
                 loss_mask = [0] * self.gen_token_length + [1] * (len(message_ids) - self.gen_token_length)
             else:
