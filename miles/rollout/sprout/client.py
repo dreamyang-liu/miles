@@ -44,7 +44,7 @@ class SproutRolloutClient:
         return response.json()
 
     async def submit(self, request: RolloutRequest) -> Acknowledgement:
-        body = await self._call("POST", "/rollout-groups", json=request.model_dump(mode="json"))
+        body = await self._call("POST", "/rollout-groups", json=request.wire())
         return Acknowledgement.model_validate(body)
 
     async def get_result(self, rollout_job_id: str) -> RolloutResult:

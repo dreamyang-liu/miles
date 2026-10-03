@@ -28,6 +28,7 @@ from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainIn
 from miles.rollout.data_source import RolloutDataSource
 from miles.rollout.inference_rollout.compatibility import call_rollout_function
 from miles.rollout.sprout.rollout_fn import SproutRolloutFn
+from miles.utils.function_registry import load_function
 
 #: What RolloutDataSource, SproutRolloutFn and the reward path read beyond the
 #: flags below; train.py's parser sets the same defaults.
@@ -69,7 +70,9 @@ DEFAULTS = dict(
     save_debug_trajectory_data=None,
     load_debug_rollout_data=None,
     ci_inject_rollout_data_path=None,
+    custom_reward_post_process_path=None,
 )
+SEARCH_REWARDS = "miles.rollout.sprout.rewards.post_process_rewards"
 
 
 def parse_args() -> Namespace:
@@ -97,7 +100,11 @@ def parse_args() -> Namespace:
     parsed = parser.parse_args()
     if not parsed.sprout_rollout_base_url:
         parser.error("--sprout-rollout-base-url is required")
-    return Namespace(**{**DEFAULTS, **vars(parsed)})
+    args = Namespace(**{**DEFAULTS, **vars(parsed)})
+    if args.sprout_rollout_search_points:
+        # What train.py is given as --custom-reward-post-process-path for a search.
+        args.custom_reward_post_process_path = SEARCH_REWARDS
+    return args
 
 
 def main() -> None:
@@ -107,15 +114,24 @@ def main() -> None:
     fn = SproutRolloutFn(RolloutFnConstructorInput(args=args, data_source=data_source))
     output = call_rollout_function(fn, RolloutFnTrainInput(rollout_id=args.rollout_id, weight_version=None))
     samples, metadata = postprocess_rollout_data(args, output.samples, train_parallel_config=None)
-    raw, normalized = _post_process_rewards(args, samples, None)
+    if args.custom_reward_post_process_path:
+        raw, normalized = load_function(args.custom_reward_post_process_path)(args, samples)
+    else:
+        raw, normalized = _post_process_rewards(args, samples, None)
     print(json.dumps(output.metrics, indent=2))
     print(
-        f"{'group':>5} {'index':>5} {'status':>9} {'reward':>6} {'advantage':>9} {'tokens':>6} {'response':>8} {'trained':>7}"
+        f"{'group':>5} {'index':>5} {'role':>8} {'status':>9} {'reward':>6} {'advantage':>9} "
+        f"{'tokens':>6} {'response':>8} {'trained':>7}  condition"
     )
     for sample, reward, advantage in zip(samples, raw, normalized, strict=True):
+        lineage = (sample.train_metadata or {}).get("sprout_rollout", {})
+        condition = lineage.get("group") or "root"
+        if lineage.get("role") == "distill":
+            condition = f"repair {lineage['point_id']}#{lineage['candidate']} gain={lineage['gain']:.2f} share={lineage['share']:.2f}"
         print(
-            f"{sample.group_index:>5} {sample.index:>5} {sample.status.value:>9} {reward:>6.2f} {advantage:>9.3f} "
-            f"{len(sample.tokens):>6} {sample.response_length:>8} {sum(sample.loss_mask):>7}"
+            f"{sample.group_index:>5} {sample.index:>5} {lineage.get('role', 'root'):>8} {sample.status.value:>9} "
+            f"{reward:>6.2f} {advantage:>9.3f} {len(sample.tokens):>6} {sample.response_length:>8} "
+            f"{sum(sample.loss_mask):>7}  {condition}"
         )
     if args.save_debug_rollout_data:
         save_debug_rollout_data(args, samples, rollout_id=args.rollout_id, evaluation=False, metadata=metadata)

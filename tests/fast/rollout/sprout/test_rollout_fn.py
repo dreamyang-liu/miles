@@ -28,7 +28,7 @@ def test_built_request_is_sprouts_documented_request():
     """Everything but the fresh job id and the slot ids derived from it equals
     the example Sprout ships, so the two repositories document one wire."""
     request, slots = construct(args())._build_request(group=group(), rollout_id=1)
-    wire = request.model_dump(mode="json")
+    wire = request.wire()
     example = sprout_request()
     assert without_ids(wire) == without_ids({**example, "finalization_timeout_seconds": 1800.0})
     assert wire["rollout_job_id"].startswith("miles-1-3-")

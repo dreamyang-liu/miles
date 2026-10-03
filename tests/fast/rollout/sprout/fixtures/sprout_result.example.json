@@ -8,6 +8,7 @@
       "sample_slot_id": "miles-1-3-34d7527f2ecc48c3b1a3d1c6bb6b2e9f:slot:11",
       "branch_id": "job-0",
       "parent_branch_id": null,
+      "group": null,
       "messages": [
         {
           "content": "fix task",
@@ -47,11 +48,13 @@
         "attempt_id": "attempt-job-0",
         "source_image": "prime/primeintellect/task:base",
         "graded_snapshot_id": "ABC",
+        "progress": 1.0,
         "origin": {},
         "provenance": {
           "prefix_messages": 0,
           "inserted_messages": []
         },
+        "search": null,
         "logprob_context": "hint_free_messages"
       }
     }

@@ -97,6 +97,54 @@ budget is still graded. It arrives with `status="truncated"` and its
 `--sprout-rollout-finalization-timeout-seconds` for the final snapshots and
 grading.
 
+## Hindsight search
+
+The model repairs well once it has seen how an attempt failed, and samples
+worse first-shot. `--sprout-rollout-search-points N` turns each task's rollout
+into a small search whose purpose is to move that repair ability into the
+one-shot policy:
+
+1. The `n_samples_per_prompt` roots run and are graded as above.
+2. Sprout reviews the failed roots with the policy itself under SPROUT's
+   analyst and reviewer prompts and picks `N` branch points in total; at each
+   it writes `--sprout-rollout-search-candidates` independent repair turns
+   (identical proposals merge, keeping their multiplicity).
+3. From each point Sprout runs `--sprout-rollout-search-student-continuations`
+   branches with nothing added (the policy's own first step there) and
+   `--sprout-rollout-search-candidate-continuations` branches after each repair
+   turn, each limited to the turns the root had left at that point, and grades
+   them all.
+
+Every branch comes back with its `group` (`student:<point>` or
+`repair:<point>:<candidate>`), the restored prefix and the inserted turn marked
+as not the policy's output, and `progress`, the share of the task's tests that
+passed. What the trainer gets from a task:
+
+| samples | loss | weight |
+|---|---|---|
+| roots | GRPO in the prompt group | 1 |
+| student and repair continuations | GRPO in their own groups, prefix and inserted turn masked | `--sprout-rollout-branch-advantage-scale` (0 keeps them out of the batch) |
+| one distillation sample per verified repair: the repair turn in its one-shot context | weighted NLL; the weight is the advantage | `(multiplicity / reviews) * max(0, repair progress - student progress) * --sprout-rollout-distill-weight` |
+
+A repair is verified by its continuations against the student continuations at
+the same point, so the roots' reward never enters the distillation weight and a
+repair that did not beat what the policy does on its own is not distilled. The
+weights reach the loss through
+`--custom-reward-post-process-path miles.rollout.sprout.rewards.post_process_rewards`,
+which a search requires: roots and branches are normalized within their groups,
+a distillation sample's reward is passed through. Sample counts vary per step,
+so disable `--rollout-trim-samples` or use a dynamic global batch size. The
+request needs `n_samples_per_prompt + N * (students + candidates * continuations)`
+slots; `--sprout-rollout-search-review-seconds` and
+`--sprout-rollout-search-wall-time-seconds` are added to what Miles waits for a
+group. On the Sprout side the driver config needs a `review` section naming the
+worker profile that runs reviews (`docs/RL_DRIVER.md`).
+
+The step's metrics report how far the student continuations and the repaired
+continuations got at the same points (`rollout/sprout/search/*`): the gap
+between them is what the distillation is meant to close, and the roots'
+success rate is what it is meant to raise.
+
 ## Without a GPU
 
 Everything up to the optimizer step runs on a CPU host. `rollout_only.py` drives

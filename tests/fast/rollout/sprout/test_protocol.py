@@ -11,7 +11,7 @@ def test_sprout_request_example_validates_and_round_trips():
     example = sprout_request()
     request = RolloutRequest.model_validate(example)
     assert request.model_dump(mode="json", exclude_unset=True) == example
-    assert request.model_dump(mode="json") == {**example, "finalization_timeout_seconds": 1800.0}
+    assert request.wire() == {**example, "finalization_timeout_seconds": 1800.0}, "no search: no search key on the wire"
 
 
 def test_sprout_result_example_validates_and_round_trips():

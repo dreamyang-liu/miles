@@ -43,6 +43,34 @@ class Budget(FrozenStrictBaseModel):
     max_wall_time_seconds: float = Field(strict=True, gt=0, allow_inf_nan=False)
 
 
+class SearchSpec(FrozenStrictBaseModel):
+    """Hindsight branches after the roots (Sprout's ``rl_driver.messages.SearchSpec``).
+
+    ``roots`` scratch rollouts take the first slots. Once they are graded,
+    Sprout reviews the failed ones, picks ``points`` branch points in total and,
+    per point, writes ``candidates`` repair turns; it then runs
+    ``student_continuations`` branches with nothing added and
+    ``candidate_continuations`` after each repair, filling the remaining slots.
+    """
+
+    roots: StrictInt = Field(gt=0)
+    points: StrictInt = Field(gt=0)
+    candidates: StrictInt = Field(ge=0)
+    student_continuations: StrictInt = Field(gt=0)
+    candidate_continuations: StrictInt = Field(ge=0)
+    review_seconds: float = Field(strict=True, gt=0, allow_inf_nan=False)
+    wall_time_seconds: float = Field(strict=True, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_search(self) -> SearchSpec:
+        if (self.candidates == 0) != (self.candidate_continuations == 0):
+            raise ValueError("candidates and candidate_continuations are both zero or both positive")
+        return self
+
+    def branches(self) -> int:
+        return self.points * (self.student_continuations + self.candidates * self.candidate_continuations)
+
+
 class RolloutRequest(FrozenStrictBaseModel):
     rollout_job_id: NonEmptyStr
     rollout_id: StrictInt = Field(ge=0)
@@ -62,6 +90,7 @@ class RolloutRequest(FrozenStrictBaseModel):
     finalization_timeout_seconds: float = Field(default=1800.0, strict=True, gt=0, allow_inf_nan=False)
     sampling_params: dict[str, Any] = Field(default_factory=dict)
     budgets: Budget
+    search: SearchSpec | None = None
 
     @model_validator(mode="after")
     def validate_request(self) -> RolloutRequest:
@@ -73,7 +102,19 @@ class RolloutRequest(FrozenStrictBaseModel):
             raise ValueError("sample slots must have unique ids and indices")
         if not self.minimum_returned_samples <= self.max_samples <= len(self.sample_slots):
             raise ValueError("expected 1 <= minimum_returned_samples <= max_samples <= len(sample_slots)")
+        if self.search is not None:
+            if self.minimum_returned_samples > self.search.roots:
+                raise ValueError("only the roots are guaranteed: minimum_returned_samples <= search.roots")
+            if self.search.roots + self.search.branches() > self.max_samples:
+                raise ValueError("max_samples must cover the roots and every branch the search may make")
         return self
+
+    def wire(self) -> dict[str, Any]:
+        """The body Sprout takes: ``search`` only when there is one."""
+        body = self.model_dump(mode="json")
+        if body["search"] is None:
+            del body["search"]
+        return body
 
 
 class Acknowledgement(FrozenStrictBaseModel):
@@ -87,6 +128,10 @@ class Trajectory(FrozenStrictBaseModel):
     sample_slot_id: NonEmptyStr
     branch_id: NonEmptyStr
     parent_branch_id: NonEmptyStr | None = None
+    #: Which trajectories were sampled under one condition, for a search
+    #: request: ``root`` for the scratch rollouts, ``student:<point>`` and
+    #: ``repair:<point>:<candidate>`` for the branches; None without a search.
+    group: NonEmptyStr | None = None
     messages: list[dict[str, Any]] = Field(min_length=1)
     tools: list[dict[str, Any]] = Field(default_factory=list)
     reward: StrictNumber
