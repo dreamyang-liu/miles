@@ -78,9 +78,37 @@ def run_script(prepare_data: ModuleType, monkeypatch, tmp_path: Path, flags: dic
         "--parser-file": str(parser_file),
         **flags,
     }
-    monkeypatch.setattr(sys, "argv", ["prepare_data.py", *(item for pair in argv.items() for item in pair)])
+    monkeypatch.setattr(sys, "argv", ["prepare_data.py",
+                                      *(item for key, value in argv.items() for item in (key, value) if item is not None)])
     prepare_data.main()
     return tmp_path / "out"
+
+
+def prompts(output: Path) -> list[str]:
+    return [json.loads(line)["prompt"][0]["content"] for line in (output / "miles.jsonl").read_text().splitlines()]
+
+
+def test_the_prompt_carries_the_interface_the_tests_use(prepare_data, monkeypatch, tmp_path):
+    """The hidden tests often call what only the dataset's interface names; --no-interface is upstream's prompt."""
+    interface = "Function: resize(width: int) -> Widget\nLocation: widgets.core"
+    first = prepare_data.prompt_for({**row("octo__widgets-1"), "interface": interface})
+    assert first.startswith("Work in /widgets and fix this issue:\n\nWidget.resize drops the border.")
+    assert first.endswith("The fix provides this interface, which the tests use:\n\n" + interface)
+    for none in ("No new interfaces are introduced.", "", None):
+        assert prepare_data.prompt_for({**row("octo__widgets-1"), "interface": none}) == (
+            "Work in /widgets and fix this issue:\n\nWidget.resize drops the border.")
+    assert interface not in prepare_data.prompt_for({**row("octo__widgets-1"), "interface": interface}, interface=False)
+    # Through the script: on by default, recorded in the manifest, and off with --no-interface.
+    plain = row
+    monkeypatch.setattr(sys.modules[__name__], "row", lambda task_id: {**plain(task_id), "interface": interface})
+    (tmp_path / "on").mkdir()
+    (tmp_path / "off").mkdir()
+    with_interface = run_script(prepare_data, monkeypatch, tmp_path / "on", {})
+    without = run_script(prepare_data, monkeypatch, tmp_path / "off", {"--no-interface": None})
+    assert json.loads((with_interface / "manifest.json").read_text())["prompt_interface"] is True
+    assert json.loads((without / "manifest.json").read_text())["prompt_interface"] is False
+    assert all(prompt.endswith(interface) for prompt in prompts(with_interface))
+    assert not any(interface in prompt for prompt in prompts(without))
 
 
 def driver_config(output: Path) -> dict:

@@ -47,9 +47,26 @@ REVIEW_MAX_OUTPUT_TOKENS = 32768
 REVIEW_PROMPT_CHARS = 250_000
 
 
-def prompt_for(row: dict) -> str:
+#: What the dataset's ``interface`` field says when a task adds no function, class or method.
+NO_INTERFACE = "No new interfaces are introduced."
+
+
+def prompt_for(row: dict, *, interface: bool = True) -> str:
+    """The task as the agent reads it: the issue and, unless ``interface`` is off, the dataset's interface text.
+
+    The hidden tests of many tasks call a function, class or method the issue
+    never names; the dataset's ``interface`` field names it (signature and
+    module). Without it those tasks cannot be solved from the prompt: 56 of the
+    420 gated Python tasks import a name the base commit lacks and only the
+    interface gives. PrimeIntellect's environment sends the issue alone, which
+    ``interface=False`` reproduces.
+    """
     workdir = "/" + row["repo"].split("/", 1)[1]
-    return f"Work in {workdir} and fix this issue:\n\n{row['problem_statement']}"
+    prompt = f"Work in {workdir} and fix this issue:\n\n{row['problem_statement']}"
+    text = (row.get("interface") or "").strip()
+    if interface and text and text != NO_INTERFACE:
+        prompt += f"\n\nThe fix provides this interface, which the tests use:\n\n{text}"
+    return prompt
 
 
 def prepare(
@@ -67,6 +84,7 @@ def prepare(
     runstore_url: str,
     grade_wall_seconds: int,
     review: dict,
+    interface: bool = True,
 ) -> int:
     output.mkdir(parents=True, exist_ok=True)
     if any((output / name).exists() for name in OUTPUTS):
@@ -79,7 +97,7 @@ def prepare(
                 raise ValueError(f"Duplicate task id {task_id}")
             seen.add(task_id)
             record = {
-                "prompt": [{"role": "user", "content": prompt_for(row)}],
+                "prompt": [{"role": "user", "content": prompt_for(row, interface=interface)}],
                 "metadata": {"task_id": task_id, "image": row["image_name"]},
             }
             miles.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -136,6 +154,7 @@ def prepare(
                 "parser_source_revision": PARSER_REVISION,
                 "task_file_sha256": dataset_hash,
                 "parser_sha256": parser_hash,
+                "prompt_interface": interface,
                 "tasks": len(tasks),
             },
             indent=2,
@@ -229,6 +248,12 @@ def parse_args() -> argparse.Namespace:
         metavar="INSTANCE_ID",
         help="keep only these instance ids (repeatable)",
     )
+    parser.add_argument(
+        "--no-interface",
+        dest="interface",
+        action="store_false",
+        help="send the issue alone, as PrimeIntellect's environment does, without the dataset's interface text",
+    )
     parser.add_argument("--source-jsonl", type=Path, help="local raw task rows instead of the Hub dataset")
     parser.add_argument("--source-parquet", type=Path, help="a local copy of the dataset's parquet file")
     parser.add_argument("--parser-file", type=Path, help="a local copy of the log parser; its bytes are pinned")
@@ -303,6 +328,7 @@ def main():
         runstore_url=args.runstore_url,
         grade_wall_seconds=args.grade_wall_seconds,
         review=review_section(args),
+        interface=args.interface,
     )
     print(f"Prepared {count} tasks in {args.output_dir}")
 
