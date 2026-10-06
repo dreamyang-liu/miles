@@ -55,10 +55,13 @@
           "inserted_messages": []
         },
         "search": null,
-        "logprob_context": "hint_free_messages"
+        "logprob_context": "hint_free_messages",
+        "zero_reason": null,
+        "touched_test_paths": []
       }
     }
   ],
+  "failed_samples": [],
   "search_branches": 0,
   "consumed_budget": {},
   "status": "completed",

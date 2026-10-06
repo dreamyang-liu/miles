@@ -2,10 +2,14 @@
 
 Everything up to the optimizer step needs no GPU: Sprout runs the agents against
 whatever Chat Completions endpoint serves the policy, grades, and returns
-messages; this script imports them exactly as the trainer would, applies
-Miles's GRPO reward normalization and saves the samples in the format
-``--load-debug-rollout-data`` reads, so the same rollout can later feed a real
-training step on a GPU host.
+messages; this script imports them exactly as the trainer would, gives them the
+advantages ``train.py`` would -- Miles's GRPO reward normalization, or for a
+search (``--sprout-rollout-search-points``) GSML's credit through
+``rewards.post_process_gsml`` -- prints one line per sample, and saves the
+samples in the format ``--load-debug-rollout-data`` reads. The file carries no
+``dynamic_global_batch_size``: Miles records it when it trims a step to the
+trainer's data-parallel size, and nothing here trims, so a trainer run with
+``--use-dynamic-global-batch-size`` (``run_qwen3_8_27b.py``) refuses it.
 
     python examples/swe-rebench-sprout/rollout_only.py \
         --prompt-data /tmp/swe-inputs/miles.jsonl --hf-checkpoint Qwen/Qwen3-8B \
@@ -27,11 +31,12 @@ from miles.ray.rollout.train_data_conversion import _post_process_rewards
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
 from miles.rollout.data_source import RolloutDataSource
 from miles.rollout.inference_rollout.compatibility import call_rollout_function
-from miles.rollout.sprout.rollout_fn import SproutRolloutFn
+from miles.rollout.sprout.rollout_fn import GSML_POST_PROCESS, SproutRolloutFn
 from miles.utils.function_registry import load_function
+from miles.utils.types import Sample
 
 #: What RolloutDataSource, SproutRolloutFn and the reward path read beyond the
-#: flags below; train.py's parser sets the same defaults.
+#: flags below: train.py's defaults, except where a comment says otherwise.
 DEFAULTS = dict(
     rollout_global_dataset=True,
     rollout_shuffle=False,
@@ -64,15 +69,19 @@ DEFAULTS = dict(
     rewards_normalization=True,
     grpo_std_normalization=True,
     reward_key=None,
+    normalize_advantages=False,
+    # As run_qwen3_8_27b.py trains, and as a search requires: GSML's advantage
+    # is every trainable token's, and a step returns however many samples it made.
+    calculate_per_token_loss=True,
+    use_dynamic_global_batch_size=True,
+    # No trainer, so no data-parallel size to trim the step to.
     disable_rollout_trim_samples=True,
-    use_dynamic_global_batch_size=False,
     global_batch_size=None,
     save_debug_trajectory_data=None,
     load_debug_rollout_data=None,
     ci_inject_rollout_data_path=None,
     custom_reward_post_process_path=None,
 )
-SEARCH_REWARDS = "miles.rollout.sprout.rewards.post_process_rewards"
 
 
 def parse_args() -> Namespace:
@@ -81,11 +90,21 @@ def parse_args() -> Namespace:
     parser.add_argument("--hf-checkpoint", required=True, help="tokenizer and chat template of the policy")
     parser.add_argument("--model-name", default=None, help="the model name Sprout's gateway sends to the endpoint")
     parser.add_argument("--rollout-batch-size", type=int, default=1, help="prompt groups per rollout")
-    parser.add_argument("--n-samples-per-prompt", type=int, default=2, help="rollouts per task, the GRPO group")
+    parser.add_argument(
+        "--n-samples-per-prompt",
+        type=int,
+        default=2,
+        help="rollouts per task: the GRPO group, or a search's two roots",
+    )
     parser.add_argument("--rollout-id", type=int, default=0)
     parser.add_argument("--rollout-temperature", type=float, default=1.0)
     parser.add_argument("--rollout-max-response-len", type=int, default=None, help="max_new_tokens per model call")
-    parser.add_argument("--loss-mask-type", default="qwen", choices=("qwen", "qwen3", "distill_qwen"))
+    parser.add_argument(
+        "--loss-mask-type",
+        default="qwen3",
+        choices=("qwen", "qwen3", "distill_qwen"),
+        help="as the launcher trains; a search refuses a mask type that does not train an inserted turn's reasoning",
+    )
     parser.add_argument(
         "--save-debug-rollout-data",
         default=None,
@@ -103,8 +122,30 @@ def parse_args() -> Namespace:
     args = Namespace(**{**DEFAULTS, **vars(parsed)})
     if args.sprout_rollout_search_points:
         # What train.py is given as --custom-reward-post-process-path for a search.
-        args.custom_reward_post_process_path = SEARCH_REWARDS
+        args.custom_reward_post_process_path = GSML_POST_PROCESS
     return args
+
+
+def print_samples(samples: list[Sample], rewards: list[float], advantages: list[float]) -> None:
+    """One line per sample: its reward and advantage A, and for a search sample its GSML credit --
+    the case of its task, its z-score in its group and its share of the task's λ (``gsml.Credit``)."""
+
+    def number(value: float | None) -> str:
+        return "-" if value is None else f"{value:.3f}"
+
+    print(
+        f"{'group':>5} {'index':>5} {'role':>7} {'status':>9} {'reward':>6} {'case':>10} {'z':>7} {'share':>6} "
+        f"{'A':>7} {'tokens':>6} {'response':>8} {'trained':>7}  condition"
+    )
+    for sample, reward, advantage in zip(samples, rewards, advantages, strict=True):
+        lineage = (sample.train_metadata or {}).get("sprout_rollout", {})
+        credit = lineage.get("credit") or {}
+        print(
+            f"{sample.group_index:>5} {sample.index:>5} {lineage.get('role', 'root'):>7} {sample.status.value:>9} "
+            f"{reward:>6.2f} {credit.get('case', '-'):>10} {number(credit.get('z')):>7} "
+            f"{number(credit.get('lambda_share')):>6} {advantage:>7.3f} {len(sample.tokens):>6} "
+            f"{sample.response_length:>8} {sum(sample.loss_mask):>7}  {lineage.get('group') or 'root'}"
+        )
 
 
 def main() -> None:
@@ -119,20 +160,7 @@ def main() -> None:
     else:
         raw, normalized = _post_process_rewards(args, samples, None)
     print(json.dumps(output.metrics, indent=2))
-    print(
-        f"{'group':>5} {'index':>5} {'role':>8} {'status':>9} {'reward':>6} {'advantage':>9} "
-        f"{'tokens':>6} {'response':>8} {'trained':>7}  condition"
-    )
-    for sample, reward, advantage in zip(samples, raw, normalized, strict=True):
-        lineage = (sample.train_metadata or {}).get("sprout_rollout", {})
-        condition = lineage.get("group") or "root"
-        if lineage.get("role") == "distill":
-            condition = f"repair {lineage['point_id']}#{lineage['candidate']} gain={lineage['gain']:.2f} share={lineage['share']:.2f}"
-        print(
-            f"{sample.group_index:>5} {sample.index:>5} {lineage.get('role', 'root'):>8} {sample.status.value:>9} "
-            f"{reward:>6.2f} {advantage:>9.3f} {len(sample.tokens):>6} {sample.response_length:>8} "
-            f"{sum(sample.loss_mask):>7}  {condition}"
-        )
+    print_samples(samples, raw, normalized)
     if args.save_debug_rollout_data:
         save_debug_rollout_data(args, samples, rollout_id=args.rollout_id, evaluation=False, metadata=metadata)
         print("saved", Path(args.save_debug_rollout_data.format(rollout_id=args.rollout_id)))

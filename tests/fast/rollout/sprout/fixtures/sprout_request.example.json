@@ -23,8 +23,8 @@
   "max_turns": 10,
   "sampling_params": {
     "temperature": 0.6,
-    "top_p": 0.95,
-    "top_k": 20,
+    "top_p": 1.0,
+    "top_k": -1,
     "max_new_tokens": 512,
     "stop": [
       "stop-here"

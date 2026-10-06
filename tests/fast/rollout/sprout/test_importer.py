@@ -1,7 +1,7 @@
 import pytest
-from tests.fast.rollout.sprout.conftest import group, sprout_result
+from tests.fast.rollout.sprout.conftest import INSERTED_TURN, group, search_result, sprout_result, toy_mask_generator
 
-from miles.rollout.sprout.importer import import_trajectories
+from miles.rollout.sprout.importer import ahat_sample, import_trajectories, import_trajectory
 from miles.rollout.sprout.protocol import RolloutResult
 from miles.utils.types import Sample
 
@@ -46,7 +46,7 @@ def test_tool_arguments_become_mappings_for_the_chat_template(mask_generator):
     assert call["function"]["arguments"] == {"command": "pwd"}
 
 
-@pytest.mark.parametrize("reason", ["timeout", "max_turns_reached"])
+@pytest.mark.parametrize("reason", ["timeout", "max_turns_reached", "interrupted"])
 def test_graded_cutoff_is_truncated_with_its_reason(mask_generator, reason):
     body = sprout_result()
     body["trajectories"][0].update(status="truncated", stop_reason=reason, reward=0.0)
@@ -144,5 +144,55 @@ def test_a_trajectory_must_say_which_messages_the_policy_sampled(mask_generator,
 def test_a_branch_whose_own_turns_are_all_unsampled_has_nothing_to_train(mask_generator):
     body = branch_body()
     body["trajectories"][0]["metadata"]["provenance"] = {"prefix_messages": 3, "inserted_messages": [3, 5]}
+    result = RolloutResult.model_validate(body)
     with pytest.raises(ValueError, match="no trainable assistant tokens"):
-        import_trajectories(RolloutResult.model_validate(body), slots(group()), mask_generator)
+        import_trajectories(result, slots(group()), mask_generator)
+    # In a search its reward still counts (gsml): it is estimation-only, not an error.
+    assert import_trajectory(result, result.trajectories[0], group()[0], mask_generator, weight_version=None) is None
+
+
+def repair():
+    """A repair continuation of a search, its inserted turn in the canonical form, and its slot sample."""
+    body, slots = search_result([0.0, 0.0], {"p1": {"students": [0.0, 0.0], "candidates": [[1.0]]}})
+    result = RolloutResult.model_validate(body)
+    (trajectory,) = [t for t in result.trajectories if t.group == "repair:p1:1"]
+    return result, trajectory, slots[trajectory.sample_slot_id]
+
+
+def test_a_canonical_repair_renders_its_reasoning_as_context_and_trains_the_continuation(mask_generator):
+    result, trajectory, slot = repair()
+    assert trajectory.messages[3] == INSERTED_TURN
+    sample = import_trajectory(result, trajectory, slot, mask_generator, weight_version=None)
+    assert trained_text(mask_generator, sample) == "fixed </m>", "the continuation's own turn is the target"
+    assert "<a> <think> parser broken </think>" in mask_generator.tokenizer.decode(sample.tokens)
+    assert [m.get("step_loss_mask") for m in sample.metadata["messages"]] == [0, 0, 0, 0, None, None]
+    assert sample.train_metadata["sprout_rollout"]["role"] == "repair"
+    assert sample.group_index is None, "a branch's group is the search's to assign (gsml)"
+
+
+def test_an_ahat_sample_trains_the_inserted_turn_alone_in_its_context(mask_generator):
+    _result, trajectory, slot = repair()
+    sample = ahat_sample(trajectory, slot, mask_generator, index=100, group_index=50, weight_version=7)
+    messages = sample.metadata["messages"]
+    assert [m["role"] for m in messages] == ["user", "assistant", "tool", "assistant"], "the history up to the turn"
+    assert [m.get("step_loss_mask") for m in messages] == [None, 0, None, None]
+    inserted = mask_generator.tokenizer.apply_chat_template([messages[-1]], tokenize=True, return_dict=False)
+    trained = [t for t, keep in zip(sample.tokens[-sample.response_length :], sample.loss_mask, strict=True) if keep]
+    assert trained == inserted[mask_generator.gen_token_length :], "its reasoning and its call, nothing else"
+    assert trained_text(mask_generator, sample).startswith("<think> parser broken </think>")
+    assert (sample.index, sample.group_index, sample.reward, sample.status) == (100, 50, 1.0, Sample.Status.COMPLETED)
+    lineage = sample.train_metadata["sprout_rollout"]
+    assert lineage["role"] == "ahat" and lineage["sample_slot_id"] == trajectory.sample_slot_id
+    assert lineage["weight_version"] == 7 and lineage["stop_reason"] is None
+
+
+def test_an_ahat_sample_needs_an_inserted_turn_and_is_none_when_nothing_trains():
+    _result, trajectory, slot = repair()
+    # distill_qwen trains only the last message's content, which a canonical turn leaves empty.
+    distill = toy_mask_generator(tokenizer_type="distill_qwen")
+    assert ahat_sample(trajectory, slot, distill, index=100, group_index=50, weight_version=None) is None
+    student = trajectory.model_copy(
+        update={"metadata": {**trajectory.metadata, "provenance": {"prefix_messages": 3, "inserted_messages": []}}}
+    )
+    with pytest.raises(ValueError, match="no inserted turn"):
+        ahat_sample(student, slot, toy_mask_generator(), index=100, group_index=50, weight_version=None)

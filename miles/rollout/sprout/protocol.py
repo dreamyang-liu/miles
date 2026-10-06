@@ -21,7 +21,8 @@ StrictNumber = StrictFloat | StrictInt
 
 GroupStatus = Literal["queued", "running", "completed", "early_stopped", "failed", "cancelled"]
 TrajectoryStatus = Literal["completed", "truncated"]
-StopReason = Literal["max_turns_reached", "timeout"]
+#: ``interrupted``: the attempt failed after closed turns and was cut back to the last of them.
+StopReason = Literal["max_turns_reached", "timeout", "interrupted"]
 
 #: Group statuses the driver never leaves again.
 TERMINAL_GROUP_STATUSES = frozenset({"completed", "early_stopped", "failed", "cancelled"})
@@ -46,11 +47,21 @@ class Budget(FrozenStrictBaseModel):
 class SearchSpec(FrozenStrictBaseModel):
     """Hindsight branches after the roots (Sprout's ``rl_driver.messages.SearchSpec``).
 
-    ``roots`` scratch rollouts take the first slots. Once they are graded,
-    Sprout reviews the failed ones, picks ``points`` branch points in total and,
-    per point, writes ``candidates`` repair turns; it then runs
-    ``student_continuations`` branches with nothing added and
-    ``candidate_continuations`` after each repair, filling the remaining slots.
+    ``roots`` scratch rollouts take the first slots. Once they are graded, the
+    task's outcome (``gsml.search_outcome``) decides what Sprout samples next.
+    Every graded root resolved, or none was graded: nothing. Some resolved
+    (TF), or none did but one is missing (FF_partial): a review of each failed
+    root picks up to ``points`` branch points in it, and
+    ``tf_student_continuations`` branches with nothing added run from each (0:
+    none). Every root was graded and none resolved (FF): the review also writes
+    ``candidates`` repair turns per point, and ``student_continuations``
+    branches with nothing added and ``candidate_continuations`` after each
+    repair run from it. Under FF the repairs come in up to ``repair_rounds``
+    rounds: where no student and no repair has resolved, the failed repair of
+    the last round is reviewed again and one more turn inserted later in its
+    own history; more than one round takes one candidate and one continuation
+    per round. The branches fill the remaining slots, enough for the outcome
+    that makes the most (``branches()``).
     """
 
     roots: StrictInt = Field(gt=0)
@@ -58,6 +69,8 @@ class SearchSpec(FrozenStrictBaseModel):
     candidates: StrictInt = Field(ge=0)
     student_continuations: StrictInt = Field(gt=0)
     candidate_continuations: StrictInt = Field(ge=0)
+    tf_student_continuations: StrictInt = Field(ge=0)
+    repair_rounds: StrictInt = Field(gt=0)
     review_seconds: float = Field(strict=True, gt=0, allow_inf_nan=False)
     wall_time_seconds: float = Field(strict=True, gt=0, allow_inf_nan=False)
 
@@ -65,10 +78,24 @@ class SearchSpec(FrozenStrictBaseModel):
     def validate_search(self) -> SearchSpec:
         if (self.candidates == 0) != (self.candidate_continuations == 0):
             raise ValueError("candidates and candidate_continuations are both zero or both positive")
+        if self.repair_rounds > 1 and (self.candidates, self.candidate_continuations) != (1, 1):
+            raise ValueError("more than one repair round takes one candidate and one candidate continuation")
         return self
 
     def branches(self) -> int:
-        return self.points * (self.student_continuations + self.candidates * self.candidate_continuations)
+        """The most the search may make, ``points`` in each failed root: all of them failed (FF), or all
+        but one (TF, FF_partial). Sprout computes the same number and refuses fewer slots."""
+        every_root_failed = self.roots * (
+            self.student_continuations + self.candidates * self.candidate_continuations * self.repair_rounds
+        )
+        all_but_one = (self.roots - 1) * self.tf_student_continuations
+        return self.points * max(every_root_failed, all_but_one)
+
+    def search_seconds(self, grade_seconds: float) -> float:
+        """How long the search may run after its roots: each round's review and branches, and the grades
+        of every round but the last (Sprout's ``SearchSpec.search_seconds``)."""
+        rounds = self.repair_rounds if self.candidates else 1
+        return rounds * (self.review_seconds + self.wall_time_seconds) + (rounds - 1) * grade_seconds
 
 
 class RolloutRequest(FrozenStrictBaseModel):
@@ -125,6 +152,30 @@ class Acknowledgement(FrozenStrictBaseModel):
 
 
 class Trajectory(FrozenStrictBaseModel):
+    """One returned rollout: hint-free messages, the 0/1 verdict as ``reward``, and Sprout's ``metadata``.
+
+    ``metadata`` stays a free dict; what Miles reads of it:
+
+    - ``provenance``: ``prefix_messages`` and ``inserted_messages``, the
+      messages no policy sampled (a branch's restored history, a repair's
+      inserted turn), kept in the context and out of the loss.
+    - ``zero_reason``: None when the grade gave a verdict; otherwise why it did
+      not (``grade_no_verdict``, ``grade_failed``, ...). Such a trajectory is
+      missing: its ``reward`` is 0.0 only because the wire needs a number, and
+      a search credits it nothing and counts it in no statistic.
+    - ``touched_test_paths``: the task's test files the graded patch changed
+      (None when unknown). A repair continuation that touched any, or cannot
+      say, counts as unresolved in GSML (R' = 0).
+    - ``search``, for a search request: ``kind`` (root, student or repair) and
+      the task's ``outcome`` and ``root_counts``, which must match Miles's own;
+      a branch's ``point_id``; a repair's ``candidate`` and ``leak_terms``,
+      the hidden test names and paths its inserted turn names that its history
+      did not show (None: there was nothing to check it against).
+
+    GSML (``gsml.assemble_search_group``) refuses a search trajectory that
+    lacks what it reads.
+    """
+
     sample_slot_id: NonEmptyStr
     branch_id: NonEmptyStr
     parent_branch_id: NonEmptyStr | None = None
@@ -157,6 +208,14 @@ class Trajectory(FrozenStrictBaseModel):
         return self
 
 
+class FailedSample(FrozenStrictBaseModel):
+    """A slot whose trajectory could not be returned (its actor failed): missing, not unsolved -- it trains
+    nothing and counts in no statistic, as a 0 or otherwise."""
+
+    sample_slot_id: NonEmptyStr
+    reason: str
+
+
 class RolloutResult(FrozenStrictBaseModel):
     """``GET /rollout-groups/{id}``: the group's state, with its trajectories once terminal."""
 
@@ -165,6 +224,7 @@ class RolloutResult(FrozenStrictBaseModel):
     max_samples: StrictInt = Field(gt=0)
     actual_samples: StrictInt = Field(ge=0)
     trajectories: list[Trajectory] = Field(default_factory=list)
+    failed_samples: list[FailedSample] = Field(default_factory=list)
     search_branches: StrictInt = Field(ge=0)
     consumed_budget: dict[str, Any] = Field(default_factory=dict)
     status: GroupStatus
@@ -176,4 +236,6 @@ class RolloutResult(FrozenStrictBaseModel):
             raise ValueError("actual_samples must count the trajectories returned")
         if len({trajectory.sample_slot_id for trajectory in self.trajectories}) != len(self.trajectories):
             raise ValueError("a sample slot is filled at most once")
+        if {failed.sample_slot_id for failed in self.failed_samples} & {t.sample_slot_id for t in self.trajectories}:
+            raise ValueError("a failed sample slot returned a trajectory")
         return self
