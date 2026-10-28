@@ -1,10 +1,12 @@
 """RAFO loss for ``--loss-type custom_loss``.
 
-Each sample carries its RAFO role in ``Sample.train_metadata`` (``batch["metadata"]``): ``rafo_kind`` (root,
-repair or reflect), ``rafo_adv`` (local RLOO advantage) and ``rafo_coef`` (fixed coefficient that includes the
-token normalizer). Root and repair samples get PPO with dual clip on their loss-mask tokens; a reflect sample gets
-CE on the reviewer-turn tokens. The loss is a plain weighted token sum: miles then divides each optimizer step by
-its number of rollouts (tasks), which supplies the 1/B of the RAFO objective.
+    --custom-loss-function-path miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function
+
+Each sample carries its ``RafoRole`` in ``Sample.train_metadata`` (``batch["metadata"]``): its kind, its local RLOO
+advantage and its fixed coefficient, the token normalizer included. Root and repair samples get PPO with dual clip
+on their loss-mask tokens; a reflect sample gets CE on the reviewer-turn tokens. The loss is a plain weighted token
+sum: miles divides each optimizer step by its number of rollouts, one for each task, which supplies the 1/B of the
+RAFO objective.
 """
 
 from argparse import Namespace
@@ -15,12 +17,8 @@ import torch
 from miles.backends.training_utils.data.context_parallel import get_local_response_loss_masks
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy
 from miles.backends.training_utils.loss.hub.math_utils import compute_policy_loss
+from miles.rollout.sprout.rafo_role import KIND_REFLECT, RafoRole
 from miles.utils.types import RolloutBatch
-
-KIND_ROOT = "root"
-KIND_REPAIR = "repair"
-KIND_REFLECT = "reflect"
-KINDS = (KIND_ROOT, KIND_REPAIR, KIND_REFLECT)
 
 
 def rafo_loss_function(
@@ -92,16 +90,13 @@ def rafo_loss_function(
 
 def _sample_columns(batch: RolloutBatch) -> tuple[list[str], list[float], list[float]]:
     metadata = batch.get("metadata")
-    if metadata is None or any(m is None or "rafo_kind" not in m for m in metadata):
+    if metadata is None:
         raise ValueError(
-            "the RAFO loss needs Sample.train_metadata with rafo_kind / rafo_adv / rafo_coef on every sample "
-            "(produced by examples.experimental.rafo.generate.generate) and the Megatron backend, which "
-            "forwards it to the loss as batch['metadata']"
+            "the RAFO loss reads each sample's train_metadata, which reaches it as batch['metadata'] only under "
+            "the Megatron backend"
         )
-    kinds = [m["rafo_kind"] for m in metadata]
-    if unknown := set(kinds) - set(KINDS):
-        raise ValueError(f"unknown rafo_kind {sorted(unknown)}; expected one of {KINDS}")
-    return kinds, [float(m["rafo_adv"]) for m in metadata], [float(m["rafo_coef"]) for m in metadata]
+    roles = [RafoRole.of(m) for m in metadata]
+    return [r.kind for r in roles], [r.adv for r in roles], [r.coef for r in roles]
 
 
 def _check_supported(args: Namespace) -> None:

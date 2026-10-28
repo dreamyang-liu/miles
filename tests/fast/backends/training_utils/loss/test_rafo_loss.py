@@ -12,15 +12,15 @@ from miles.backends.training_utils.loss.objective import loss_function
 from miles.utils.args.custom_function import CustomFunctionConfig
 from miles.utils.args.custom_view import ImmutableNamespace
 
-LOSS_PATH = "examples.experimental.rafo.loss.rafo_loss_function"
+LOSS_PATH = "miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function"
 VOCAB = 32
 PROMPT_LENS = [5, 3, 4, 6]
 RESPONSE_LENS = [6, 4, 7, 5]
 METADATA = [
-    {"rafo_kind": "root", "rafo_adv": 0.75, "rafo_coef": 0.25},
-    {"rafo_kind": "root", "rafo_adv": -0.25, "rafo_coef": 0.25},
-    {"rafo_kind": "repair", "rafo_adv": -1.0, "rafo_coef": 0.125},
-    {"rafo_kind": "reflect", "rafo_adv": 0.0, "rafo_coef": 0.5},
+    {"rafo": {"kind": "root", "adv": 0.75, "coef": 0.25}},
+    {"rafo": {"kind": "root", "adv": -0.25, "coef": 0.25}},
+    {"rafo": {"kind": "repair", "adv": -1.0, "coef": 0.125}},
+    {"rafo": {"kind": "reflect", "adv": 0.0, "coef": 0.5}},
 ]
 
 
@@ -61,14 +61,14 @@ def _reference_loss(logits: torch.Tensor, inputs: dict, eps: float = 0.2, dual_c
         new = rows.gather(1, tokens[p : p + r, None]).squeeze(1)
         mask = inputs["loss_masks"][i].bool()
         meta = METADATA[i]
-        if meta["rafo_kind"] == "reflect":
+        if meta["rafo"]["kind"] == "reflect":
             per_token = -new
         else:
             ratio = torch.exp(torch.clamp(new - inputs["log_probs"][i], -20, 20))
-            adv = meta["rafo_adv"]
+            adv = meta["rafo"]["adv"]
             pg = torch.maximum(-ratio * adv, -ratio.clamp(1 - eps, 1 + eps) * adv)
             per_token = torch.minimum(pg, torch.full_like(pg, -dual_c * adv)) if adv < 0 else pg
-        total = total + meta["rafo_coef"] * per_token[mask].sum()
+        total = total + meta["rafo"]["coef"] * per_token[mask].sum()
         offset += p + r
     return total
 

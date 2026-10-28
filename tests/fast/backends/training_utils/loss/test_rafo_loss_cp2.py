@@ -20,15 +20,15 @@ register_cpu_ci(est_time=15, suite="stage-a-cpu", labels=[])
 PROMPT_LENS = [6, 2, 5, 3]
 RESPONSE_LENS = [6, 6, 7, 5]
 METADATA = [
-    {"rafo_kind": "root", "rafo_adv": 0.5, "rafo_coef": 0.25},
-    {"rafo_kind": "repair", "rafo_adv": -1.0, "rafo_coef": 0.125},
-    {"rafo_kind": "reflect", "rafo_adv": 0.0, "rafo_coef": 0.5},
-    {"rafo_kind": "root", "rafo_adv": -0.5, "rafo_coef": 0.25},
+    {"rafo": {"kind": "root", "adv": 0.5, "coef": 0.25}},
+    {"rafo": {"kind": "repair", "adv": -1.0, "coef": 0.125}},
+    {"rafo": {"kind": "reflect", "adv": 0.0, "coef": 0.5}},
+    {"rafo": {"kind": "root", "adv": -0.5, "coef": 0.25}},
 ]
 
 
 def _args(*, allgather_cp: bool, true_on_policy_mode: bool) -> ImmutableNamespace:
-    config = CustomFunctionConfig(path="examples.experimental.rafo.loss.rafo_loss_function")
+    config = CustomFunctionConfig(path="miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function")
     return ImmutableNamespace(
         **dict(
             make_args(
