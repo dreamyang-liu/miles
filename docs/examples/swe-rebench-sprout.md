@@ -10,9 +10,8 @@ prompt group is one `POST /rollout-groups` to Sprout's RL driver. Sprout runs
 the policy endpoint. It grades each final snapshot with the official
 SWE-rebench procedure in a fresh sandbox, and returns every trajectory as Chat
 Completions messages with a 0/1 reward. Trained as they come back, those
-rollouts are standard GRPO; the launcher below runs a hindsight search instead,
-credited by GSML (see [Hindsight search](#hindsight-search)) or by RAFO (see
-[RAFO credit](#rafo-credit)).
+rollouts are standard GRPO; the launcher below runs each task as a RAFO search
+instead (see [RAFO search](#rafo-search)).
 
 ```text
 Miles SproutRolloutFn ── POST /rollout-groups ──> Sprout RL driver (:11001)
@@ -31,10 +30,10 @@ everything but the assistant turns and recomputes log-probs on that sequence.
 Without a search the samples keep their `group_index`, so
 `--advantage-estimator grpo` normalizes rewards within each task's group
 exactly as for any other rollout. Nothing from
-the sampling process is imported: Sprout returns no tokens or log-probs. A branch
-continuation's hint is wrapped in `<sprout_training_hint>` and removed before
-export, so the hint-conditioned probabilities would not describe the trained
-sequence anyway. For that reason `--use-rollout-logprobs`,
+the sampling process is imported: Sprout returns no tokens or log-probs, and a
+RAFO continuation's history holds a reviewer's turn that the policy did not
+sample, so the sampling probabilities would not describe the trained sequence
+anyway. For that reason `--use-rollout-logprobs`,
 `--skip-actor-forward-only`, TIS and rollout routing, indexer or sampling-support
 replay (`--rollout-top-p` below 1 or a positive `--rollout-top-k`) are refused at
 construction, as are `--rollout-stop-token-ids` and
@@ -85,9 +84,9 @@ The reviewer is the policy, and its thinking counts against
 at `xhigh` unless the request names a `reasoning_effort` (`low`, `medium` or
 `xhigh`), and at Sprout's default of 16384 tokens a reviewer can spend whole
 calls thinking and return no plan; a search whose review fails ends at its
-roots. A larger budget makes each call longer, and an `FF` task's review makes
-three calls in a row (the analysis, the point review and a repair turn), all
-within `--sprout-rollout-search-review-seconds`. At about three characters per
+roots. A larger budget makes each call longer, and each review makes three
+calls in a row for a failed trajectory (the analysis, the point review and the
+turn), all within `--sprout-rollout-rafo-review-seconds`. At about three characters per
 token, a rough rate for code and logs, 250000 characters are 83k tokens, so a
 prompt fits beside 32768 output tokens in the 131072-token context the launcher
 gives SGLang, which refuses a request that does not fit.
@@ -125,14 +124,14 @@ The launcher colocates the trainer, tensor-parallel 2 × context-parallel 4 over
 the whole node, with SGLang engines of 2 GPUs each on one 8-GPU node, and
 checks that `max_tokens_per_gpu * cp` holds one whole `max_context_len`
 trajectory. It converts the checkpoint once and passes these rollout options to
-`train.py`, with the search options listed under [Flags](#flags):
+`train.py`, with the RAFO options listed under [Flags](#flags):
 
 ```text
 --rollout-function-path miles.rollout.sprout.rollout_fn.SproutRolloutFn
 --sprout-rollout-base-url http://SPROUT_HOST:11001
 --sprout-rollout-model-endpoint http://THIS_HOST:18081   # how Sprout's agents reach the router
 --sprout-rollout-max-turns 64                            # model calls per trajectory
---n-samples-per-prompt 2                                 # the two roots of each task
+--n-samples-per-prompt 4                                 # RAFO's M roots of each task
 --rollout-top-p 1.0 --rollout-top-k -1                   # the full softmax the trainer scores
 --loss-mask-type qwen3
 --sglang-reasoning-parser qwen3 --sglang-tool-call-parser qwen3_coder
@@ -150,264 +149,67 @@ budget is still graded. It arrives with `status="truncated"` and its
 `--sprout-rollout-finalization-timeout-seconds` for the final snapshots and
 grading.
 
-## Hindsight search
+## RAFO search
 
-The model repairs well once it has seen how an attempt failed, and samples
-worse first-shot. `--sprout-rollout-search-points N` turns each task's rollout
-into a small search whose purpose is to move that repair ability into the
-one-shot policy. It samples the policy again from inside its own failed
-attempts, on its own and after a reviewer's repair turn, and GSML
-(`miles.rollout.sprout.gsml`) decides what each of those samples is credited
-with: the repair turn earns credit only where the policy on its own did not
-recover.
+The model repairs well once it sees what went wrong, and samples worse
+first-shot. `--sprout-rollout-rafo` turns each task's rollout into RAFO's forest
+(reviewer-guided forest RL): where every attempt failed, a reviewer exposes the
+problem with one turn in the agent's own voice, the agent continues on its own,
+and the policy learns both its continuations and the turn.
 
 ### What Sprout samples
 
-A search has two roots, the task's `n_samples_per_prompt`; construction refuses
-any other number. Once the roots are graded, the task's outcome decides what
-Sprout runs next:
+A RAFO search (Sprout's `RafoSearchSpec`, `{"mode": "rafo", ...}` on the wire)
+runs in four steps:
 
-| outcome | roots | what Sprout runs next |
-|---|---|---|
-| `TT` | both graded, both resolved | nothing |
-| `TF` | one resolved, one failed | a review of the failed root picks up to `N` points in it; `--sprout-rollout-search-tf-student-continuations` students run from each |
-| `FF` | both graded, neither resolved | a review of each root picks up to `N` points in it and writes `--sprout-rollout-search-candidates` repair turns per point; from each point run `--sprout-rollout-search-student-continuations` students and `--sprout-rollout-search-candidate-continuations` continuations after each repair turn, for up to `--sprout-rollout-search-repair-rounds` rounds |
-| `FF_partial` | one failed, the other missing | as for `TF` |
-| `TT_partial` | one resolved, the other missing | nothing |
-| `ungraded` | neither graded | nothing |
+1. Roots. The task's `--n-samples-per-prompt` roots (M) run from scratch and
+   are graded.
+2. Gate. Only a task none of whose graded roots resolved (`FF` or `FF_partial`)
+   is reviewed. Any other task ends at its roots.
+3. Events. The review reads each failed root, at most S of them, and picks one
+   point in it: the state right after the first observation that went wrong.
+   There it writes the agent's next turn: what to check and why, and the bash
+   commands of the check. The turn never contains the fix, and never edits the
+   repository. K continuations restored at the point run after the turn and its
+   real output. A turn and its continuations are one event.
+4. Depth. When every graded continuation of an event failed, the next review
+   reads the first of them and writes one more turn in its history, at most D
+   deep and S events in all.
 
-With `--sprout-rollout-search-tf-student-continuations 0`, `TF` and `FF_partial`
-tasks are not branched either, and get no review. Miles recomputes the outcome
-from the roots it gets back and refuses a group whose annotations
-(`metadata.search.outcome`) say otherwise.
-
-A student continues from the point's restored state with nothing added: the
-policy's own next turn there. A repair continuation first runs the reviewer's
-turn, inserted into the history and executed, so its real tool results follow
-it. Every branch is limited to the turns its root had left at that point, and
-comes back with its `group` (`student:<point>` or `repair:<point>:<candidate>`)
-and its restored prefix and inserted turn marked as not the policy's output.
-The reviewer is the policy itself under SPROUT's analyst and reviewer prompts:
-it reads each failed root with its grading verdict, and identical repair turns
-merge, keeping their multiplicity.
+The reviewer is the policy itself, under Sprout's RAFO prompts
+(`resources/review/rafo_prompts.yaml`), and it may abstain. Each continuation
+comes back with its `group` (`event:<n>`) and with `metadata.search`: its
+`event`, `depth` and the `parent_job_id` that the event's turn went into (a
+root, or a continuation one depth up). Its restored prefix and every inserted
+turn are marked as not the policy's output. Miles recomputes the roots' label
+and refuses a group whose annotations say otherwise, or whose forest is larger
+than its search (`miles/rollout/sprout/forest.py`).
 
 A trajectory is missing when its actor failed (Sprout names its slot in
 `failed_samples`) or its grade gave no verdict (`metadata.zero_reason`, such as
 `grade_failed`). A missing trajectory is neither resolved nor failed: it trains
-nothing and enters no count or z-score below. A patch that does not apply, or
-tests that run out of time, is a verdict: 0.
+nothing and enters no group below. A patch that does not apply, or tests that
+run out of time, is a verdict: 0.
 
-### What each sample is credited with
+### What each sample trains
 
-Every sample gets one advantage `A`, carried by each of its trainable tokens.
-`gsml.assemble_search_group` annotates the sample with its credit
-(`train_metadata["sprout_rollout"]["credit"]`), and
-`rewards.post_process_gsml` computes
-`A = β·z + λ·(ψ for an â sample, else 1)·share` when the step is trained, so a
-saved rollout can be re-credited under other GSML flags.
-
-| sample | trained tokens | `A` |
-|---|---|---|
-| root | its turns | `β_root·z`, with `β_root = (1 − λ)/√2` |
-| student, group `student:<point>` | its turns after the restored prefix | `β_br·z`; a resolved student of an `FF` task adds `λ·ω_s/c_s` |
-| repair continuation of candidate `m`, group `repair:<point>:<m>` | its turns after the prefix and the inserted turn | `β_br·z`, with `z` taken on `R′`; in an `FF` task, if `m` is in `E_s`, it adds `λ·R′·ω_s/(#E_s·K_m)` |
-| â sample, one per candidate in `E_s` | the inserted turn alone (its reasoning and its calls), after the history it was inserted into | `ψ·λ·ω_s/#E_s`, never negative; reward 1 |
-
-- `z` is the trajectory's z-score among the gradable trajectories of its group
-  (the task's roots, `student:<point>`, `repair:<point>:<m>`):
-  `(R − mean)/(std + 1e-6)` with the unbiased standard deviation, and 0 when
-  fewer than two are gradable or all agree. A trajectory with nothing to train
-  (every turn restored or inserted) still counts in its group and in `c_s` and
-  `K_m`.
-- `R` is the 0/1 verdict. `R′ = R`, except that a repair continuation whose patch
-  changed a file of the task's test patch, or whose grade cannot say, has
-  `R′ = 0` (below).
-- `c_s` counts the students that resolved at point `s`, and `K_m` sums `R′` over
-  candidate `m`'s gradable continuations.
-- `E_s`, of size `#E_s`, holds the eligible candidates at `s`, and is empty
-  unless a student was graded at `s` and none resolved. A candidate is eligible
-  when `K_m ≥ 1`, its turn passes the leak gate and the inserted turn is
-  canonical.
-- A point is creditable when a student was graded there and either one resolved
-  or `E_s` is not empty. Each creditable point of the task gets
-  `ω_s = 1/(the task's creditable points)`; every other point gets 0.
-
-Only an `FF` task carries λ credit. In `TT`, `TF` and the partial cases every
-`A` is `β·z` alone. At a point where a student resolved, the credit goes to
-those students: the policy's own success from that state, an exact signal.
-Only where none did does the reviewer's turn earn credit, through its resolved
-continuations and its â sample; that signal is biased, since the policy did
-not sample the turn. The restored prefix only ever serves as context.
-`--sprout-rollout-gsml-c-pre` (credit for the prefix) and
-`--sprout-rollout-gsml-kappa-plus` (guided credit when a root resolved) are not
-implemented; anything but 0 is refused. Samples whose `A` is 0 stay in the
-batch.
-
-At λ = 0.4 and β_br = ψ = 1, a `TF` task's roots (1, 0) get ±0.30 and its
-students (1, 0) ±0.7071. In an `FF` task with two points, both roots get 0, and:
-
-- At P1 the students resolve (1, 0): 0.9071 and −0.7071. Candidate 1's
-  continuations (1, 0) get ±0.7071; candidate 2's (0, 0) get 0.
-- At P2 the students fail (0, 0): 0. Candidate 1's continuations resolve (1, 1)
-  and its turn names nothing hidden: 0.10 each, and its â sample 0.20.
-  Candidate 2's turn names `tests/test_hidden.py`: its continuations (1, 0) get
-  ±0.7071, and it has no â sample.
-- Both points are creditable, so ω = ½ at each.
-
-### The leak gate and R′
-
-The reviewer reads the grading verdict, so its turn can name what the policy
-could not have known at that point. For every repair, Sprout lists in
-`metadata.search.leak_terms` the hidden terms its inserted turn names that the
-history up to the point did not show; a term counts as named when it occurs in
-the turn's text. Hidden terms are the paths in the task's test patch of at
-least 6 characters, and their basenames of that length unless every repository
-has one (`conftest.py`, `setup.py` and the like), and the task's FAIL_TO_PASS
-test names of at least 8 characters, with their `[A-Za-z0-9_]+` parts of at
-least 8 characters that are not all digits. PASS_TO_PASS names are not hidden.
-A candidate passes the gate only when the list is empty for each of its
-gradable continuations. A `null` list (the grade had neither list to check
-against) fails the gate too. A candidate that fails the gate keeps its
-continuations' `β_br·z` and gets no â sample.
-
-Each grade also reports `touched_test_paths`, the files of the task's test patch
-that the graded patch changed. A repair continuation that changed any resolved
-nothing it can be credited for: `R′ = 0`, in its z-score and in `K_m`. So does
-one whose grade cannot say (`touched_test_paths` not a list). Students and roots
-keep their `R`.
-
-### Canonical rendering
-
-Sprout inserts the reviewer's turn as the assistant's reasoning, not as its
-reply:
-`{"role": "assistant", "content": "", "reasoning_content": "<the reviewer's text>", "tool_calls": [...]}`
-(`assistant_turn_rendering: "reasoning"`). The â sample then trains that turn
-as the policy produces one, its thinking and then its calls. A candidate whose
-inserted turn has blank reasoning, or content of more than one line, is not
-eligible. On its first step, before it submits anything, a search renders a
-probe turn of that form and refuses a chat template and `--loss-mask-type`
-under which the probe's reasoning is not trained
-(`gsml.check_reasoning_is_trained`). With Qwen3.8's template, `qwen3` passes and
-`qwen` is refused.
-
-### The loss
-
-The advantage is final. `--advantage-estimator grpo` broadcasts it over the
-sample's trainable tokens. `--normalize-advantages` is refused: whitening `A`
-across the batch would move every zero and rescale the λ shares.
-
-`--calculate-per-token-loss` makes the loss a sum over the step's trainable
-tokens, each weighted by its sample's `A`, so every token weighs alike whatever
-its sample's length. The sum is divided by the step's trainable-token count.
-That count varies from step to step, and samples whose `A` is 0 (`TT` roots,
-groups that agree) add to it, so the update is consistent, not exact. An exact
-update needs a constant divisor, a CP-aware reducer that is not built yet. With
-context parallelism (the launcher's CP = 4), Miles counts each sample's tokens
-on every CP rank and scales the loss by the CP size, and Megatron reduces the
-count over DP × CP, so the two cancel.
-
-How many samples a step returns varies, so a search needs
-`--use-dynamic-global-batch-size`: one optimizer step over every sample, rounded
-down to a multiple of the data-parallel size (1 in the launcher). A fixed
-`--global-batch-size` would trim the step to a multiple of itself.
-
-### Flags
-
-The launcher passes:
-
-```text
---sprout-rollout-search-points 1                    # N: points per failed root
---sprout-rollout-search-candidates 1                # FF: repair turns per point and round
---sprout-rollout-search-student-continuations 1     # FF: students per point
---sprout-rollout-search-candidate-continuations 1   # FF: continuations per repair turn
---sprout-rollout-search-tf-student-continuations 2  # TF, FF_partial: students per point
---sprout-rollout-search-repair-rounds 3             # FF: rounds of repair, each after the last's failure
---sprout-rollout-search-review-seconds 900          # each round's review wall time
---sprout-rollout-search-wall-time-seconds 900       # each round's branch phase wall time
---custom-reward-post-process-path miles.rollout.sprout.rewards.post_process_gsml
---sprout-rollout-gsml-lambda 0.4                    # λ, in [0, 1]
---sprout-rollout-gsml-beta-branch 1.0               # β_br, at least 0
---sprout-rollout-gsml-psi 1.0                       # ψ, at least 0
---sprout-rollout-gsml-c-pre 0.0                     # not implemented: must be 0
---sprout-rollout-gsml-kappa-plus 0.0                # not implemented: must be 0
---advantage-estimator grpo --calculate-per-token-loss --use-dynamic-global-batch-size
-```
-
-Miles's own defaults differ for `--sprout-rollout-search-candidates` (4), the
-student and candidate continuations (2), `--sprout-rollout-search-repair-rounds`
-(1) and both wall times (3600 s). More than one repair round needs one candidate
-and one candidate continuation: a round reviews the previous round's failed
-continuation on its own, picks one point in its history and inserts one more
-turn there, and runs only where neither the point's student nor an earlier
-round's repair resolved. A chain that resolves trains every round's turn as an
-â sample, the candidate's share split among them. Construction refuses a search without
-`--n-samples-per-prompt 2`, that post-process path, `--advantage-estimator grpo`,
-`--calculate-per-token-loss` or `--use-dynamic-global-batch-size`, or with
-`--normalize-advantages`.
-
-A request carries a slot for every branch of the outcome that branches most:
-`roots + N·max(roots·(students + candidates·continuations·rounds), (roots − 1)·tf_students)`,
-which is 10 with the launcher's values (2 + max(8, 2)). Slots left unfilled are
-not failures. `--sprout-rollout-search-review-seconds` and
-`--sprout-rollout-search-wall-time-seconds` are added to what Miles waits for a
-group. On the Sprout side the driver config needs the `review` section
-`prepare_data.py` writes (see [Prepare the data](#prepare-the-data)).
-
-### Metrics
-
-Each step sums, over its tasks, under `rollout/sprout/gsml/`:
-
-- `cases/<outcome>`: how many tasks had each outcome.
-- For `FF` tasks, `points`, split into `points_exact`, `points_guided` and
-  `points_no_mass` by how they were credited.
-- For `FF` tasks, `candidates`, with the gates they passed or failed:
-  `candidates_eligible`, `candidates_leaked`, `candidates_unverified` (a `null`
-  leak list), `candidates_noncanonical` and `candidates_unconfirmed` (`K_m` = 0).
-- `ahat`, the â samples made, and `ahat_untrainable`, the eligible candidates
-  whose turn rendered nothing to train.
-- `continuations_touching_tests`, the repair continuations whose `R′` is 0
-  because they changed the task's test files or their grade cannot say.
-- `estimation_only`, the gradable trajectories with nothing to train.
-- `lambda_tasks`, the tasks that carried λ credit.
-
-`rollout/sprout/ungradable` and `rollout/sprout/failed_samples` count the
-missing trajectories, and `rollout/sprout/reward_mean` is taken over the
-gradable ones.
-
-## RAFO credit
-
-With `--credit rafo` (`--sprout-rollout-credit rafo`), the same search trains
-with RAFO (`miles/rollout/sprout/rafo.py`) instead of GSML. Sprout still runs
-the roots, the review, the branches and the repair rounds. What changes is what
-each sample trains:
+`rafo.assemble_rafo_group` gives each sample its role
+(`train_metadata["rafo"]`), which the RAFO loss reads:
 
 | Sample | Loss | Advantage | Coefficient |
 |---|---|---|---|
 | root | PPO with dual clip | local RLOO among the task's gradable roots | 1/(M·C) |
-| student or repair | PPO with dual clip | local RLOO within its condition (`Trajectory.group`) | 1/(G·K·C) |
-| reviewer turn | CE on the turn alone (its reasoning, its calls, its end of turn), after its history | none | w/(T·C_h) |
+| continuation | PPO with dual clip | local RLOO among its event's gradable continuations | 1/(S·K·C) |
+| reviewer turn | CE on the turn alone (its reasoning, its calls, its end of turn), after its history | none | w/(S·C_h) |
 
-The denominators are constants of the search, so no coefficient depends on what
-was sampled:
-
-- M is the number of roots.
-- G is the most continuation groups that one task can make:
-  roots·points·(1 + candidates·rounds), or the bound for the `TF` shape.
-- K is the planned size of the group.
-- T is the most reviewer turns: roots·points·candidates·rounds.
-- C and C_h are `--sprout-rollout-rafo-c` and `--sprout-rollout-rafo-c-h`.
-
-A turn's weight w is computed in two steps:
-
-1. Take the mean, over the turn's gradable continuations, of max(R′, w_child).
-   w_child is the weight of a later round's turn inserted in that continuation
-   (`--sprout-rollout-rafo-turn-credit subtree`). With `own`, only R′ counts.
-2. For a first-round turn, subtract the mean R of the students at its point
-   (`--sprout-rollout-rafo-baseline students`; `none` subtracts nothing). The
-   result is at least 0.
-
-R′, the leak gate and the canonical rendering are GSML's (above). A turn that
-fails the gate or the rendering gets w = 0.
+M, S and K are constants of the search, so no coefficient depends on what was
+sampled; C and C_h are `--sprout-rollout-rafo-c` and `--sprout-rollout-rafo-c-h`.
+A turn's weight w is the mean, over its event's gradable continuations, of R,
+the 0/1 verdict. Under `--sprout-rollout-rafo-turn-credit subtree`, a
+continuation with an event inside it counts max(R, w of that event), so a turn
+whose continuation a deeper review rescued gets credit for it; with `own`, only
+R counts. A continuation's restored prefix and inserted turns are context only:
+each turn trains once, in its own event's CE sample.
 
 These samples train nothing:
 
@@ -415,12 +217,63 @@ These samples train nothing:
 - a turn with w = 0.
 
 A task with no signal keeps one zero-weight root, so that it still counts in
-its step.
+its step. All samples of a task share its rollout id. Miles trains them in one
+step and divides the step's loss by its number of tasks. So
+`--global-batch-size` counts tasks: the launcher uses half the rollout batch,
+which gives two steps. `--allow-partial-train-step` keeps a short last step when
+a group failed.
 
-All samples of a task share its rollout id. Miles trains them in one step and
-divides the step's loss by its number of tasks. So `--global-batch-size` counts
-tasks: the launcher uses half the rollout batch, which gives two steps.
-`--allow-partial-train-step` keeps a short last step when a group failed.
+### Hidden tests
+
+The reviewer reads the grading verdict, so its turn could name what the policy
+could not have known at that point. Sprout checks each turn against the task's
+hidden tests (`leak_terms`, and the leak judge when one is configured) and makes
+no event of a turn that names them. A turn that nothing could check, because the
+grade gave no hidden-test facts (Sprout's `harbor` grader, for example), still
+makes an event; `rollout/sprout/rafo/events_unchecked` counts them.
+
+### Canonical rendering
+
+Sprout inserts the reviewer's turn as the assistant's reasoning, not as its
+reply:
+`{"role": "assistant", "content": "", "reasoning_content": "<the reviewer's text>", "tool_calls": [...]}`
+(`assistant_turn_rendering: "reasoning"`). The CE sample then trains that turn
+as the policy produces one, its thinking and then its calls; Miles refuses a
+group whose turn is not in that form. On its first step, before it submits
+anything, a RAFO search renders a probe turn of that form and refuses a chat
+template and `--loss-mask-type` under which the probe's reasoning is not trained
+(`importer.check_reasoning_is_trained`). With Qwen3.8's template, `qwen3` passes
+and `qwen` is refused.
+
+### Flags
+
+The launcher passes:
+
+```text
+--sprout-rollout-rafo
+--n-samples-per-prompt 4                          # M: roots per task
+--sprout-rollout-rafo-continuations 2             # K: continuations per event
+--sprout-rollout-rafo-depth 3                     # D: reviews, each inside the last
+--sprout-rollout-rafo-events 4                    # S: events per task
+--sprout-rollout-rafo-review-seconds 900          # each depth's review wall time
+--sprout-rollout-rafo-wall-time-seconds 900       # each depth's continuations wall time
+--sprout-rollout-rafo-c 64.0 --sprout-rollout-rafo-c-h 32.0
+--sprout-rollout-rafo-turn-credit subtree
+--loss-type custom_loss
+--custom-loss-function-path miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function
+--advantage-estimator grpo --disable-rewards-normalization
+--entropy-coef 0.0 --eps-clip 0.2 --eps-clip-high 0.2 --eps-clip-c 3.0
+--global-batch-size 8 --allow-partial-train-step
+```
+
+Miles's own defaults for both wall times are 3600 s. A request carries a slot
+for every continuation the search may make, `M + S·K` (12 with the launcher's
+values); slots left unfilled are not failures. Each depth's review and
+continuations, and the grades between depths, are added to what Miles waits for
+a group: min(D, S)·(review + wall time) + (min(D, S) − 1)·finalization time. On
+the Sprout side the driver config needs the `review` section `prepare_data.py`
+writes (see [Prepare the data](#prepare-the-data)), and the driver, the Run
+Store and the workers need a Sprout build with the RAFO search.
 
 Construction refuses a RAFO search without each of these:
 
@@ -428,44 +281,43 @@ Construction refuses a RAFO search without each of these:
 - `--train-backend megatron`, which passes `train_metadata` to the loss and
   keeps a task's samples in one step;
 - `--disable-rewards-normalization`;
-- `--n-samples-per-prompt` 2 or more.
+- `--n-samples-per-prompt` and `--sprout-rollout-rafo-continuations` of 2 or
+  more: each is a local RLOO group.
 
 It also refuses `--custom-reward-post-process-path` and
-`--use-dynamic-global-batch-size`. The loss refuses these:
+`--use-dynamic-global-batch-size`, and the RAFO loss without
+`--sprout-rollout-rafo`. The loss refuses these:
 
 - `--calculate-per-token-loss`;
 - KL and entropy terms;
 - TIS and OPSM;
 - rollout log-probs as π_old.
 
-Some graders do not give the hidden-test facts, for example Sprout's `harbor`
-grader. Then every turn's leak list is `null` and every repair's
-`touched_test_paths` is missing. Under the gates above, no reviewer turn trains
-and every repair's R′ is 0, under GSML and RAFO alike.
+### Metrics
 
 Each step sums these values over its tasks, under `rollout/sprout/rafo/`:
 
-- `cases/<outcome>`;
-- `turns`, with `turns_trained`, `turns_leaked`, `turns_unverified`,
-  `turns_noncanonical`, `turns_without_gain` and `chain_turns`;
-- `ppo_samples`, `placeholders`, `estimation_only` and `ungradable`;
-- `continuations_touching_tests`.
+- `cases/<outcome>`: how many tasks had each label of their roots;
+- `events`, with `nested_events` (deeper than 1), `events_trained` (a CE sample
+  made), `events_without_gain` (w = 0) and `events_unchecked`;
+- `ppo_samples`, `placeholders`, `estimation_only` (gradable trajectories with
+  nothing to train) and `ungradable`.
 
-The loss logs `rafo_*` sums for each task: the PPO and CE losses, the PPO and
-CE tokens, the clipped tokens and the k3 KL.
+`rollout/sprout/failed_samples` counts the slots whose actor failed, and
+`rollout/sprout/reward_mean` is taken over the gradable trajectories. The loss
+logs `rafo_*` sums for each task: the PPO and CE losses, the PPO and CE tokens,
+the clipped tokens and the k3 KL.
 
 ## Without a GPU
 
 Everything up to the optimizer step runs on a CPU host. `rollout_only.py` drives
 `SproutRolloutFn` once against any Chat Completions endpoint that serves the
-policy. It imports the trajectories as the trainer would and gives them the
-advantages `train.py` would: Miles's GRPO reward normalization, or, with
-`--sprout-rollout-search-points`, GSML's credit. For a search it sets the
-post-process path itself, and it defaults to the launcher's
-`--calculate-per-token-loss`, `--use-dynamic-global-batch-size` and
-`--loss-mask-type qwen3`. It prints one line per sample, with its role, its
-task's outcome, `z`, λ share and `A`. It then saves the samples in the format
-`--load-debug-rollout-data` reads:
+policy. It imports the trajectories as the trainer would. A plain group gets
+Miles's GRPO reward normalization; with `--sprout-rollout-rafo`, each sample
+gets its RAFO role, and the script sets the loss flags the launcher passes. It
+defaults to the launcher's `--loss-mask-type qwen3`, prints one line per sample
+with its role, reward, advantage and coefficient, and then saves the samples in
+the format `--load-debug-rollout-data` reads:
 
 ```bash
 python examples/swe-rebench-sprout/rollout_only.py \
@@ -473,8 +325,7 @@ python examples/swe-rebench-sprout/rollout_only.py \
   --model-name Qwen/Qwen3.8-27B \
   --sprout-rollout-base-url http://SPROUT_HOST:11001 \
   --sprout-rollout-model-endpoint http://MODEL_HOST:PORT \
-  --rollout-batch-size 1 --n-samples-per-prompt 2 \
-  --sprout-rollout-search-points 1 --sprout-rollout-search-candidates 2 \
+  --rollout-batch-size 1 --n-samples-per-prompt 4 --sprout-rollout-rafo \
   --save-debug-rollout-data /root/swe-rollouts/rollout_data/{rollout_id}.pt
 ```
 
@@ -482,17 +333,14 @@ Only `hf_checkpoint`'s tokenizer, chat template and processor are needed on the
 CPU side; a Qwen3.8 checkpoint's processor needs `torchvision` installed.
 
 `run_qwen3_8_27b.py --load-rollout-data <file>` trains on a saved rollout
-without SGLang or Sprout, but not yet on one `rollout_only.py` saved. The
-launcher passes `--use-dynamic-global-batch-size`, and Miles then requires the
-rollout's `dynamic_global_batch_size` metadata. Miles records it only when it
-trims a step to the trainer's data-parallel size, which `rollout_only.py` does
-not do, having no trainer. `convert_samples_to_train_data` refuses such a file
-with an assertion.
+without SGLang or Sprout. Training on a file that `rollout_only.py` saved has not
+been tried.
 
 The unit tests (`tests/fast/rollout/sprout/`) run on CPU too. They check the
 request Miles builds against the example Sprout ships, the importer against
 Sprout's shipped result example, and the rollout function against a fake driver
-over `httpx.MockTransport`. They check GSML's credit on synthetic search groups,
-the examples above among them. They also feed imported samples through Miles's
-own GRPO reward normalization and advantage computation, and check that the
-token-sum loss weighs each sample by its trainable tokens.
+over `httpx.MockTransport`. They check RAFO's credit on synthetic forests and on
+Sprout's shipped RAFO example, which they also take through Miles's train-data
+conversion, and they feed plain groups through Miles's own GRPO reward
+normalization and advantage computation. `tests/fast/backends/training_utils/loss/`
+checks the RAFO loss against a per-token reference.

@@ -13,19 +13,14 @@ samples keep their ``group_index``, so Miles's ordinary GRPO reward
 normalization (``--advantage-estimator grpo``) applies per group as it would to
 a generate_hub rollout.
 
-With ``--sprout-rollout-search-points`` a group is a hindsight search instead
-(``protocol.SearchSpec``): two roots, then the branches Sprout runs from points
-in the failed ones, every sample credited by GSML (``gsml.assemble_search_group``)
-and given its advantage by ``rewards.post_process_gsml``. That advantage is
-final and each trainable token weighs alike, so construction refuses a search
-without ``--n-samples-per-prompt 2``, that post-process,
-``--advantage-estimator grpo``, ``--calculate-per-token-loss`` and a dynamic
-global batch, or with ``--normalize-advantages``. With ``--sprout-rollout-credit
-rafo`` the search trains with RAFO instead (``rafo.assemble_rafo_group`` and the
-RAFO loss), which needs the opposite: a fixed global batch that counts tasks,
-no per-token loss, and no reward normalization (``_validate_rafo``). The first
-step probes the chat template before it submits anything
-(``gsml.check_reasoning_is_trained``).
+With ``--sprout-rollout-rafo`` a group is a RAFO search instead
+(``protocol.RafoSearchSpec``): the group's roots, then, when none resolved,
+the events Sprout runs after a reviewer's turn in each failed root, and deeper
+in a failed continuation. Every sample is credited by RAFO
+(``rafo.assemble_rafo_group``) and trained by the RAFO loss, which needs the
+Megatron backend, a fixed global batch that counts tasks, and no reward
+normalization (``_validate_rafo``). The first step probes the chat template
+before it submits anything (``importer.check_reasoning_is_trained``).
 
 A group that fails -- rejected, failed at Sprout, or returned in a shape Miles
 cannot train -- is logged and left out of the step, counted in
@@ -61,10 +56,10 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
-from miles.rollout.sprout import gsml, rafo, rewards
+from miles.rollout.sprout import rafo
 from miles.rollout.sprout.client import SproutRolloutClient
-from miles.rollout.sprout.importer import import_trajectories
-from miles.rollout.sprout.protocol import Budget, RolloutRequest, RolloutResult, SampleSlot, SearchSpec
+from miles.rollout.sprout.importer import check_reasoning_is_trained, import_trajectories
+from miles.rollout.sprout.protocol import Budget, RafoSearchSpec, RolloutRequest, RolloutResult, SampleSlot
 from miles.utils.args.custom_function import CustomFunctionConfig
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.processing_utils import load_tokenizer
@@ -72,26 +67,8 @@ from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
-#: Miles features that reuse the rollout engine's tokens or log-probs. The
-#: trajectory Sprout returns is retokenized, so none of them can be honoured.
-TOKEN_REPLAY_FLAGS = (
-    "use_rollout_logprobs",
-    "skip_actor_forward_only",
-    "use_tis",
-    "use_rollout_routing_replay",
-    "use_rollout_indexer_replay",
-    "use_sampling_support_replay",
-)
-#: The replay above that no flag names: Miles derives it from the sampling flags (``miles.utils.arguments``).
-_DERIVED_REPLAY = {
-    "use_sampling_support_replay": "sampling-support replay (--rollout-top-p below 1 or a positive --rollout-top-k)"
-}
-#: The ``--custom-reward-post-process-path`` a search needs: it applies GSML's credit as the advantage.
-GSML_POST_PROCESS = "miles.rollout.sprout.rewards.post_process_gsml"
 #: The ``--custom-loss-function-path`` of a RAFO search: PPO and CE on the roles ``rafo.assemble_rafo_group`` gives.
 RAFO_LOSS = "miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function"
-#: ``--sprout-rollout-credit``: how a search group trains.
-CREDITS = ("gsml", "rafo")
 
 
 @dataclass(frozen=True)
@@ -100,7 +77,7 @@ class _GroupRollout:
 
     samples: list[Sample]
     result: RolloutResult
-    #: ``rollout/sprout/gsml/`` counts for a search group (``gsml.assemble_search_group``); empty otherwise.
+    #: ``rollout/sprout/rafo/`` counts for a search group (``rafo.assemble_rafo_group``); empty otherwise.
     measured: dict[str, float]
 
 
@@ -120,7 +97,7 @@ class SproutRolloutFn(BaseRolloutFn):
         self._sampling_params = sampling_params(self._args)
         # A search's roots are the prompt group: n_samples_per_prompt of them (checked per group).
         self._search = self.search_spec(self._args.n_samples_per_prompt)
-        self._rafo = rafo_settings(self._args) if self._args.sprout_rollout_credit == "rafo" else None
+        self._rafo = rafo_settings(self._args) if self._search is not None else None
 
     @staticmethod
     def add_arguments(parser):
@@ -178,118 +155,44 @@ class SproutRolloutFn(BaseRolloutFn):
             help="Timeout for one HTTP request to the driver.",
         )
         group.add_argument(
-            "--sprout-rollout-search-points",
-            type=int,
-            default=0,
+            "--sprout-rollout-rafo",
+            action="store_true",
             help=(
-                "Hindsight search: after a task's roots are graded, Sprout reviews each failed one on its own and "
-                "picks up to this many branch points in it; 0 (the default) runs the roots alone. GSML credits a "
-                "search group, which needs --n-samples-per-prompt 2, --custom-reward-post-process-path "
-                f"{GSML_POST_PROCESS}, --calculate-per-token-loss and --use-dynamic-global-batch-size."
+                "Run each prompt group as a RAFO search: when none of its --n-samples-per-prompt roots resolved, "
+                "Sprout's reviewer writes a turn that exposes the problem in each failed root and continuations "
+                "run after it, and deeper in a failed continuation. The RAFO loss trains every sample of the "
+                f"task: --loss-type custom_loss --custom-loss-function-path {RAFO_LOSS}."
             ),
         )
         group.add_argument(
-            "--sprout-rollout-search-candidates",
+            "--sprout-rollout-rafo-continuations",
+            type=int,
+            default=2,
+            help="RAFO's K: the continuations after each reviewer turn (an event), one local RLOO group.",
+        )
+        group.add_argument(
+            "--sprout-rollout-rafo-depth",
+            type=int,
+            default=3,
+            help="RAFO's D: the most reviews, each inside the last event's first failed continuation.",
+        )
+        group.add_argument(
+            "--sprout-rollout-rafo-events",
             type=int,
             default=4,
-            help=(
-                "Independent repair turns the review writes per point when every root failed; 0 runs student "
-                "continuations only."
-            ),
+            help="RAFO's S: the most events of a task, and the constant that normalizes their samples.",
         )
         group.add_argument(
-            "--sprout-rollout-search-student-continuations",
-            type=int,
-            default=2,
-            help=(
-                "Continuations per point with nothing added when every root failed: the policy's own first step "
-                "there."
-            ),
-        )
-        group.add_argument(
-            "--sprout-rollout-search-candidate-continuations",
-            type=int,
-            default=2,
-            help="Continuations after each inserted repair turn.",
-        )
-        group.add_argument(
-            "--sprout-rollout-search-tf-student-continuations",
-            type=int,
-            default=2,
-            help=(
-                "Continuations per point with nothing added when the roots split, or none resolved and one is "
-                "missing: such a task gets no repair turns, and 0 does not branch it at all."
-            ),
-        )
-        group.add_argument(
-            "--sprout-rollout-search-repair-rounds",
-            type=int,
-            default=1,
-            help=(
-                "Rounds of repair when every root failed: where nothing has resolved, the last round's failed "
-                "repair is reviewed again and one more turn inserted in its history. More than one round needs "
-                "one candidate and one candidate continuation."
-            ),
-        )
-        group.add_argument(
-            "--sprout-rollout-search-review-seconds",
+            "--sprout-rollout-rafo-review-seconds",
             type=float,
             default=3600.0,
-            help="Wall time for each round's review job.",
+            help="Wall time for each depth's review job.",
         )
         group.add_argument(
-            "--sprout-rollout-search-wall-time-seconds",
+            "--sprout-rollout-rafo-wall-time-seconds",
             type=float,
             default=3600.0,
-            help="Wall time for each round's branch phase, after the roots and that round's review.",
-        )
-        # GSML's coefficients, read when the step is trained (rewards.post_process_gsml), not here.
-        group.add_argument(
-            "--sprout-rollout-gsml-lambda",
-            type=float,
-            default=0.4,
-            help=(
-                "GSML's lambda, in [0, 1]: the mass a task whose every root failed spreads over the points where "
-                "something resolved; a root's z-score is weighted (1 - lambda)/sqrt(2)."
-            ),
-        )
-        group.add_argument(
-            "--sprout-rollout-gsml-beta-branch",
-            type=float,
-            default=1.0,
-            help="GSML's beta_br, nonnegative: the weight of a student or repair continuation's z-score.",
-        )
-        group.add_argument(
-            "--sprout-rollout-gsml-psi",
-            type=float,
-            default=1.0,
-            help=(
-                "GSML's psi, nonnegative: the weight of the lambda share of an a-hat sample, a verified repair "
-                "turn trained as a one-turn target."
-            ),
-        )
-        group.add_argument(
-            "--sprout-rollout-gsml-c-pre",
-            type=float,
-            default=0.0,
-            help="Credit for the history a branch restores, which trains as context only: not implemented, 0.",
-        )
-        group.add_argument(
-            "--sprout-rollout-gsml-kappa-plus",
-            type=float,
-            default=0.0,
-            help="Guided credit for a task one of whose roots resolved: not implemented, 0.",
-        )
-        group.add_argument(
-            "--sprout-rollout-credit",
-            type=str,
-            choices=CREDITS,
-            default="gsml",
-            help=(
-                "How a search group trains. gsml: GSML's advantages through the policy loss "
-                f"({GSML_POST_PROCESS}). rafo: RAFO, PPO with local RLOO on the trajectories and CE on the "
-                f"reviewer turns, through --loss-type custom_loss --custom-loss-function-path {RAFO_LOSS}."
-            ),
+            help="Wall time for each depth's continuations, after that depth's review.",
         )
         group.add_argument(
             "--sprout-rollout-rafo-c",
@@ -309,18 +212,8 @@ class SproutRolloutFn(BaseRolloutFn):
             choices=rafo.TURN_CREDITS,
             default="subtree",
             help=(
-                "A reviewer turn's weight: a continuation that a later repair round rescued counts with that "
-                "round's weight (subtree), or only the turn's own continuations count (own)."
-            ),
-        )
-        group.add_argument(
-            "--sprout-rollout-rafo-baseline",
-            type=str,
-            choices=rafo.BASELINES,
-            default="students",
-            help=(
-                "What a first-round reviewer turn's continuations are compared with: the students at its point "
-                "(students), or nothing (none)."
+                "A reviewer turn's weight: a continuation that a deeper event rescued counts with that event's "
+                "weight (subtree), or only the turn's own continuations count (own)."
             ),
         )
         return parser
@@ -340,10 +233,9 @@ class SproutRolloutFn(BaseRolloutFn):
             raise ValueError(
                 f"data source returned {len(groups)} prompt groups; expected {self._args.rollout_batch_size}"
             )
-        # Branch and â samples need identities of their own, after every root's, and their
-        # conditions groups of their own, after every prompt's; the groups draw from both as they go.
+        # Branch and turn samples need identities of their own, after every root's; the groups draw
+        # from them as they go.
         indices = _fresh_after(sample.index for group in groups for sample in group)
-        group_indices = _fresh_after(sample.group_index for group in groups for sample in group)
         async with self._client_factory(
             self._args.sprout_rollout_base_url,
             timeout=self._args.sprout_rollout_http_timeout_seconds,
@@ -358,7 +250,6 @@ class SproutRolloutFn(BaseRolloutFn):
                         weight_version=input.weight_version,
                         mask_generator=mask_generator,
                         indices=indices,
-                        group_indices=group_indices,
                     )
                 )
                 for group in groups
@@ -373,20 +264,17 @@ class SproutRolloutFn(BaseRolloutFn):
                 raise
         return _step_output(outcomes)
 
-    def search_spec(self, roots: int) -> SearchSpec | None:
+    def search_spec(self, roots: int) -> RafoSearchSpec | None:
         args = self._args
-        if not getattr(args, "sprout_rollout_search_points", 0):
+        if not args.sprout_rollout_rafo:
             return None
-        return SearchSpec(
+        return RafoSearchSpec(
             roots=roots,
-            points=args.sprout_rollout_search_points,
-            candidates=args.sprout_rollout_search_candidates,
-            student_continuations=args.sprout_rollout_search_student_continuations,
-            candidate_continuations=args.sprout_rollout_search_candidate_continuations,
-            tf_student_continuations=args.sprout_rollout_search_tf_student_continuations,
-            repair_rounds=getattr(args, "sprout_rollout_search_repair_rounds", 1),
-            review_seconds=args.sprout_rollout_search_review_seconds,
-            wall_time_seconds=args.sprout_rollout_search_wall_time_seconds,
+            continuations=args.sprout_rollout_rafo_continuations,
+            depth=args.sprout_rollout_rafo_depth,
+            events=args.sprout_rollout_rafo_events,
+            review_seconds=float(args.sprout_rollout_rafo_review_seconds),
+            wall_time_seconds=float(args.sprout_rollout_rafo_wall_time_seconds),
         )
 
     async def _run_group_isolated(
@@ -398,7 +286,6 @@ class SproutRolloutFn(BaseRolloutFn):
         weight_version: int | None,
         mask_generator: MultiTurnLossMaskGenerator,
         indices: Iterator[int],
-        group_indices: Iterator[int],
     ) -> _GroupRollout | Exception:
         """One group's rollout, or the error that failed it: no group's failure fails another.
 
@@ -415,7 +302,6 @@ class SproutRolloutFn(BaseRolloutFn):
                 weight_version=weight_version,
                 mask_generator=mask_generator,
                 indices=indices,
-                group_indices=group_indices,
             )
         except Exception as error:
             logger.exception(
@@ -435,7 +321,6 @@ class SproutRolloutFn(BaseRolloutFn):
         weight_version: int | None,
         mask_generator: MultiTurnLossMaskGenerator,
         indices: Iterator[int],
-        group_indices: Iterator[int],
     ) -> _GroupRollout:
         try:
             acknowledgement = await client.submit(request)
@@ -454,28 +339,17 @@ class SproutRolloutFn(BaseRolloutFn):
                 timeout=timeout,
             )
             validate_result(request, result)
-            if request.search is None:
+            if request.search is None or self._rafo is None:
                 samples = import_trajectories(result, slots, mask_generator, weight_version=weight_version)
                 return _GroupRollout(samples=samples, result=result, measured={})
-            if self._rafo is not None:
-                samples, measured = rafo.assemble_rafo_group(
-                    result,
-                    slots,
-                    mask_generator,
-                    spec=request.search,
-                    settings=self._rafo,
-                    weight_version=weight_version,
-                    indices=indices,
-                )
-                return _GroupRollout(samples=samples, result=result, measured=measured)
-            samples, measured = gsml.assemble_search_group(
+            samples, measured = rafo.assemble_rafo_group(
                 result,
                 slots,
                 mask_generator,
-                planned_roots=request.search.roots,
+                spec=request.search,
+                settings=self._rafo,
                 weight_version=weight_version,
                 indices=indices,
-                group_indices=group_indices,
             )
             return _GroupRollout(samples=samples, result=result, measured=measured)
         finally:
@@ -535,10 +409,9 @@ class SproutRolloutFn(BaseRolloutFn):
         return request, dict(zip((slot.sample_slot_id for slot in slots), slot_samples, strict=True))
 
     def model_endpoint(self) -> str:
-        if configured := getattr(self._args, "sprout_rollout_model_endpoint", None):
+        if configured := self._args.sprout_rollout_model_endpoint:
             return configured.rstrip("/")
-        host = getattr(self._args, "sglang_router_ip", None)
-        port = getattr(self._args, "sglang_router_port", None)
+        host, port = self._args.sglang_router_ip, self._args.sglang_router_port
         if not host or port is None:
             raise RuntimeError(
                 "Miles's rollout router address is not known yet; pass --sprout-rollout-model-endpoint "
@@ -548,156 +421,86 @@ class SproutRolloutFn(BaseRolloutFn):
 
     def model_name(self) -> str | None:
         """The ``model`` of the Chat Completions requests Sprout's gateway sends."""
-        for name in ("sglang_served_model_name", "model_name"):
-            if value := getattr(self._args, name, None):
-                return value
-        return None
+        served = getattr(self._args, "sglang_served_model_name", None)  # config-access-exempt: an SGLang server arg
+        return served or self._args.model_name or None
 
     def _get_mask_generator(self) -> MultiTurnLossMaskGenerator:
         """The policy's chat template and loss mask, built once; one set on the instance is used as it is."""
         if self._mask_generator is None:
             tokenizer = load_tokenizer(
-                self._args.hf_checkpoint,
-                chat_template_path=getattr(self._args, "chat_template_path", None),
-                trust_remote_code=True,
+                self._args.hf_checkpoint, chat_template_path=self._args.chat_template_path, trust_remote_code=True
             )
-            mask_generator = MultiTurnLossMaskGenerator(
-                tokenizer, tokenizer_type=getattr(self._args, "loss_mask_type", "qwen")
-            )
+            mask_generator = MultiTurnLossMaskGenerator(tokenizer, tokenizer_type=self._args.loss_mask_type)
             if self._search is not None:
-                # A search trains the reviewer's inserted turns, their text as reasoning (the â
+                # A search trains the reviewer's inserted turns, their text as reasoning (their CE
                 # samples): refuse a template that would train their calls without it.
-                gsml.check_reasoning_is_trained(mask_generator)
+                check_reasoning_is_trained(mask_generator)
             self._mask_generator = mask_generator
         return self._mask_generator
 
 
 def validate_configuration(args: Any) -> None:
-    if not getattr(args, "sprout_rollout_base_url", None):
+    if not args.sprout_rollout_base_url:
         raise ValueError("--sprout-rollout-base-url is required by SproutRolloutFn")
-    for name in (
-        "sprout_rollout_timeout_seconds",
-        "sprout_rollout_finalization_timeout_seconds",
-        "sprout_rollout_poll_interval_seconds",
-        "sprout_rollout_http_timeout_seconds",
-    ):
-        value = getattr(args, name, None)
-        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
-    max_turns = getattr(args, "sprout_rollout_max_turns", None)
-    if type(max_turns) is not int or max_turns <= 0:
-        raise ValueError("--sprout-rollout-max-turns must be a positive integer")
-    for name in ("rollout_batch_size", "n_samples_per_prompt"):
-        if type(getattr(args, name, None)) is not int or getattr(args, name) <= 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be a positive integer")
-    if not getattr(args, "compute_advantages_and_returns", True):
+    _check_positive(
+        {
+            "--sprout-rollout-timeout-seconds": args.sprout_rollout_timeout_seconds,
+            "--sprout-rollout-finalization-timeout-seconds": args.sprout_rollout_finalization_timeout_seconds,
+            "--sprout-rollout-poll-interval-seconds": args.sprout_rollout_poll_interval_seconds,
+            "--sprout-rollout-http-timeout-seconds": args.sprout_rollout_http_timeout_seconds,
+        },
+        integer=False,
+    )
+    _check_positive(
+        {
+            "--sprout-rollout-max-turns": args.sprout_rollout_max_turns,
+            "--rollout-batch-size": args.rollout_batch_size,
+            "--n-samples-per-prompt": args.n_samples_per_prompt,
+        },
+        integer=True,
+    )
+    if not args.compute_advantages_and_returns:
         raise ValueError("Sprout rollouts need the ordinary RL forward and advantage path")
-    for name in TOKEN_REPLAY_FLAGS:
-        if getattr(args, name, False):
-            flag = _DERIVED_REPLAY.get(name, f"--{name.replace('_', '-')}")
+    for flag, on in _token_replay(args).items():
+        if on:
             raise ValueError(f"{flag} is incompatible with retokenized Sprout trajectories")
-    if getattr(args, "rollout_stop_token_ids", None):
+    if args.rollout_stop_token_ids:
         raise ValueError("Sprout speaks Chat Completions: use --rollout-stop text, not stop token ids")
-    if getattr(args, "apply_chat_template_kwargs", None):
+    if args.apply_chat_template_kwargs:
         raise ValueError("Sprout's gateway renders the chat template; --apply-chat-template-kwargs cannot reach it")
-    points = getattr(args, "sprout_rollout_search_points", 0)
-    if type(points) is not int or points < 0:
-        raise ValueError("--sprout-rollout-search-points must be a nonnegative integer")
-    if points:
-        _validate_search(args)
-    elif args.sprout_rollout_credit == "rafo":
-        raise ValueError("--sprout-rollout-credit rafo trains search groups: set --sprout-rollout-search-points")
-    elif getattr(args, "custom_reward_post_process_path", None) == GSML_POST_PROCESS:
-        raise ValueError(
-            f"--custom-reward-post-process-path {GSML_POST_PROCESS} credits search groups only: set "
-            "--sprout-rollout-search-points, or drop it for GRPO's own normalization"
-        )
-
-
-def _validate_search(args: Any) -> None:
-    """A search's shape, and what its credit (``--sprout-rollout-credit``) needs of the trainer."""
-    for name in (
-        "sprout_rollout_search_candidates",
-        "sprout_rollout_search_student_continuations",
-        "sprout_rollout_search_candidate_continuations",
-        "sprout_rollout_search_tf_student_continuations",
-    ):
-        value = getattr(args, name, None)
-        if type(value) is not int or value < 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be a nonnegative integer")
-    if args.sprout_rollout_search_student_continuations < 1:
-        raise ValueError("--sprout-rollout-search-student-continuations must be positive: they are the baseline")
-    rounds = getattr(args, "sprout_rollout_search_repair_rounds", 1)
-    if type(rounds) is not int or rounds < 1:
-        raise ValueError("--sprout-rollout-search-repair-rounds must be a positive integer")
-    if rounds > 1 and (args.sprout_rollout_search_candidates, args.sprout_rollout_search_candidate_continuations) != (
-        1,
-        1,
-    ):
-        raise ValueError(
-            "--sprout-rollout-search-repair-rounds above 1 needs --sprout-rollout-search-candidates 1 and "
-            "--sprout-rollout-search-candidate-continuations 1"
-        )
-    if (args.sprout_rollout_search_candidates == 0) != (args.sprout_rollout_search_candidate_continuations == 0):
-        raise ValueError(
-            "--sprout-rollout-search-candidates and --sprout-rollout-search-candidate-continuations are both 0 or "
-            "both positive"
-        )
-    for name in ("sprout_rollout_search_review_seconds", "sprout_rollout_search_wall_time_seconds"):
-        value = getattr(args, name, None)
-        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
-    if args.sprout_rollout_credit == "rafo":
+    if args.sprout_rollout_rafo:
         _validate_rafo(args)
-    else:
-        _validate_gsml(args)
-
-
-def _validate_gsml(args: Any) -> None:
-    """What GSML's credit needs of the trainer (``rewards.post_process_gsml``)."""
-    if args.n_samples_per_prompt != 2:
-        raise ValueError(
-            "a search needs --n-samples-per-prompt 2: GSML's credit is defined for a task's two roots, "
-            "a root's z-score weighted (1 - lambda)/sqrt(2)"
-        )
-    if getattr(args, "advantage_estimator", None) != "grpo":
-        raise ValueError(
-            "a search needs --advantage-estimator grpo: it broadcasts each sample's GSML advantage over its tokens"
-        )
-    if getattr(args, "custom_reward_post_process_path", None) != GSML_POST_PROCESS:
-        raise ValueError(
-            f"a search needs --custom-reward-post-process-path {GSML_POST_PROCESS}: it turns the credit "
-            "gsml.assemble_search_group gives each sample into its advantage"
-        )
-    if getattr(args, "normalize_advantages", False):
-        raise ValueError(
-            "a search refuses --normalize-advantages: GSML's advantages are final, and whitening them across the "
-            "batch would move every zero and rescale the lambda shares"
-        )
-    if not getattr(args, "calculate_per_token_loss", False):
-        raise ValueError(
-            "a search needs --calculate-per-token-loss: a GSML advantage is every trainable token's, and a "
-            "per-sample mean would weigh a sample's tokens by its length"
-        )
-    if not getattr(args, "use_dynamic_global_batch_size", False):
-        raise ValueError(
-            "a search needs --use-dynamic-global-batch-size: how many samples a search step returns varies, and a "
-            "fixed --global-batch-size trims the step to a multiple of it, dropping the samples at the end"
-        )
-    # λ, β_br and ψ in range, c_pre and κ+ 0: what post_process_gsml checks again when it applies them.
-    rewards.coefficients(args)
+    elif _custom_loss_path(args) == RAFO_LOSS:
+        raise ValueError(f"{RAFO_LOSS} trains RAFO search groups: set --sprout-rollout-rafo")
 
 
 def _validate_rafo(args: Any) -> None:
-    """What RAFO's credit needs of the trainer (``rafo.assemble_rafo_group`` and the RAFO loss)."""
-    loss = args.custom_loss_function_path
-    loss_path = loss.path if isinstance(loss, CustomFunctionConfig) else loss
+    """A RAFO search's shape, and what RAFO's credit needs of the trainer (``rafo.assemble_rafo_group`` and
+    the RAFO loss)."""
+    _check_positive(
+        {
+            "--sprout-rollout-rafo-continuations": args.sprout_rollout_rafo_continuations,
+            "--sprout-rollout-rafo-depth": args.sprout_rollout_rafo_depth,
+            "--sprout-rollout-rafo-events": args.sprout_rollout_rafo_events,
+        },
+        integer=True,
+    )
+    _check_positive(
+        {
+            "--sprout-rollout-rafo-review-seconds": args.sprout_rollout_rafo_review_seconds,
+            "--sprout-rollout-rafo-wall-time-seconds": args.sprout_rollout_rafo_wall_time_seconds,
+        },
+        integer=False,
+    )
     required = {
         "--n-samples-per-prompt of at least 2: a task's roots are one local RLOO group": (
             args.n_samples_per_prompt >= 2
         ),
+        "--sprout-rollout-rafo-continuations of at least 2: an event's continuations are one local RLOO group": (
+            args.sprout_rollout_rafo_continuations >= 2
+        ),
         f"--loss-type custom_loss --custom-loss-function-path {RAFO_LOSS}": (
-            args.loss_type == "custom_loss" and loss_path == RAFO_LOSS
+            args.loss_type == "custom_loss" and _custom_loss_path(args) == RAFO_LOSS
         ),
         "--train-backend megatron: it trains a task's samples in one step and passes their roles to the loss": (
             args.train_backend == "megatron"
@@ -713,8 +516,38 @@ def _validate_rafo(args: Any) -> None:
         ),
     }
     if missing := [condition for condition, met in required.items() if not met]:
-        raise ValueError(f"--sprout-rollout-credit rafo needs {'; '.join(missing)}")
+        raise ValueError(f"--sprout-rollout-rafo needs {'; '.join(missing)}")
     rafo_settings(args)
+
+
+def _check_positive(values: dict[str, object], *, integer: bool) -> None:
+    """Raise ValueError naming the first flag whose value is not a positive integer, or not finite and positive."""
+    for flag, value in values.items():
+        if integer and (type(value) is not int or value <= 0):
+            raise ValueError(f"{flag} must be a positive integer")
+        if not integer and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
+            raise ValueError(f"{flag} must be finite and positive")
+
+
+def _token_replay(args: Any) -> dict[str, bool]:
+    """The Miles features that reuse the rollout engine's tokens or log-probs, by the flag that turns each on.
+    The trajectory Sprout returns is retokenized, so none of them can be honoured."""
+    return {
+        "--use-rollout-logprobs": args.use_rollout_logprobs,
+        "--skip-actor-forward-only": args.skip_actor_forward_only,
+        "--use-tis": args.use_tis,
+        "--use-rollout-routing-replay": args.use_rollout_routing_replay,
+        "--use-rollout-indexer-replay": args.use_rollout_indexer_replay,
+        # No flag names it: Miles derives it from the sampling flags (miles.utils.arguments).
+        "sampling-support replay (--rollout-top-p below 1 or a positive --rollout-top-k)": (
+            args.use_sampling_support_replay
+        ),
+    }
+
+
+def _custom_loss_path(args: Any) -> str | None:
+    loss = args.custom_loss_function_path
+    return loss.path if isinstance(loss, CustomFunctionConfig) else loss
 
 
 def rafo_settings(args: Any) -> rafo.RafoSettings:
@@ -722,7 +555,6 @@ def rafo_settings(args: Any) -> rafo.RafoSettings:
         c=args.sprout_rollout_rafo_c,
         c_h=args.sprout_rollout_rafo_c_h,
         turn_credit=args.sprout_rollout_rafo_turn_credit,
-        baseline=args.sprout_rollout_rafo_baseline,
     )
 
 
@@ -735,11 +567,11 @@ def sampling_params(args: Any) -> dict[str, Any]:
         # top_k leaves it to the engine, which takes the checkpoint's generation_config (top_k 20 for
         # Qwen3) and samples from a truncated distribution while the trainer scores the full softmax:
         # Miles's --rollout-top-k wins over the checkpoint's.
-        "top_k": getattr(args, "rollout_top_k", -1),
+        "top_k": args.rollout_top_k,
     }
-    if getattr(args, "rollout_stop", None):
+    if args.rollout_stop:
         params["stop"] = list(args.rollout_stop)
-    if getattr(args, "rollout_max_response_len", None) is not None:
+    if args.rollout_max_response_len is not None:
         params["max_new_tokens"] = args.rollout_max_response_len
     return params
 
@@ -788,8 +620,13 @@ def validate_result(request: RolloutRequest, result: RolloutResult) -> None:
         raise ValueError(f"driver reports max_samples={result.max_samples}; expected {request.max_samples}")
     roots = [slot.sample_slot_id for slot in request.sample_slots[: request.search.roots]] if request.search else []
     failed = {sample.sample_slot_id for sample in result.failed_samples}
-    if not (result.status in {"completed", "early_stopped"}
-            or result.status == "failed" and not result.trajectories and roots and set(roots) <= failed):
+    if not (
+        result.status in {"completed", "early_stopped"}
+        or result.status == "failed"
+        and not result.trajectories
+        and roots
+        and set(roots) <= failed
+    ):
         detail = f": {result.stop_reason}" if result.stop_reason else ""
         raise RuntimeError(f"Sprout rollout {request.rollout_job_id!r} ended with status={result.status!r}{detail}")
     if request.search is None:
@@ -810,7 +647,9 @@ def validate_result(request: RolloutRequest, result: RolloutResult) -> None:
         )
     for trajectory in result.trajectories:
         if (trajectory.group == "root") != (trajectory.sample_slot_id in roots):
-            raise ValueError(f"trajectory {trajectory.sample_slot_id!r} is grouped as {trajectory.group!r} in its slot")
+            raise ValueError(
+                f"trajectory {trajectory.sample_slot_id!r} is grouped as {trajectory.group!r} in its slot"
+            )
 
 
 async def _release_without_masking_error(client: SproutRolloutClient, rollout_job_id: str) -> None:

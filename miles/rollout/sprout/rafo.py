@@ -1,21 +1,21 @@
-"""RAFO credit for a Sprout search group: what each sample of a task trains, and with which fixed coefficient.
+"""RAFO credit for a Sprout RAFO search: what each sample of a task trains, and with which fixed coefficient.
 
-Sprout's search is RAFO's forest. The roots run from scratch. A review of each failed root inserts a reviewer turn
-at a point before the mistake, and continuations run after it (repairs) and with nothing added (students). Later
-repair rounds review a failed repair again and insert one more turn in its own history: RAFO's nested review in
-the failed branch. RAFO trains:
+Sprout's RAFO search (``protocol.RafoSearchSpec``) returns RAFO's forest (``forest.read_forest``): the
+task's M roots and its events. An event is a reviewer's turn at a point of a failed trajectory, a
+check that exposes the problem, and the K continuations after it. A deeper event sits inside the
+first failed continuation of an event whose continuations all failed, and a task has at most S
+events. RAFO trains:
 
-- each root, student and repair with PPO, its advantage the local RLOO within the condition it was sampled under
-  (``Trajectory.group``), with the coefficient 1/(M C) for a root and 1/(G K C) for a continuation;
-- each reviewer turn with CE on the turn alone, with the coefficient w/(T C_h). w is the mean over the turn's
-  continuations of max(R', w_child), less the mean of the students at its point, and at least 0. Under
-  ``subtree`` credit, w_child is the weight of a later round's turn inserted in that continuation. A turn that names
-  hidden tests (``leak_terms``), that nothing checked or that is not in canonical form gets w = 0.
+- each root with PPO, its advantage the local RLOO among the task's roots, with the coefficient 1/(M C);
+- each continuation with PPO, its advantage the local RLOO among its event's continuations, with the
+  coefficient 1/(S K C);
+- each reviewer turn with CE on the turn alone, with the coefficient w/(S C_h). w is the mean over the
+  event's continuations of c_j = R_j, or under ``subtree`` credit max(R_j, w_u) for each event u
+  inside continuation j.
 
-M is the roots, G the most continuation groups and T the most reviewer turns one task can have, and K the planned
-size of a continuation group. All are constants of the search, so no coefficient depends on what was sampled. R' is
-GSML's: a repair that touched the task's tests counts as unresolved. Every sample of the task shares one rollout
-id, so Miles trains them in one step and divides the step by its tasks; a task without any signal keeps one
+M, S and K are constants of the search, so no coefficient depends on what was sampled. R is the 0/1
+verdict, and a missing trajectory counts for nothing. Every sample of a task shares one rollout id, so
+Miles trains them in one step and divides the step by its tasks; a task without any signal keeps one
 zero-weight root, so that it still counts.
 """
 
@@ -25,36 +25,24 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from miles.rollout.sprout.gsml import (
-    OUTCOMES,
-    SearchMember,
-    check_group,
-    checked_outcome,
-    search_candidate,
-    search_member,
-    search_outcome,
-)
-from miles.rollout.sprout.importer import ahat_sample, import_trajectory
-from miles.rollout.sprout.protocol import RolloutResult, SearchSpec
+from miles.rollout.sprout.forest import OUTCOMES, Event, Forest, Member, read_forest, search_outcome
+from miles.rollout.sprout.importer import import_trajectory, turn_sample
+from miles.rollout.sprout.protocol import RafoSearchSpec, RolloutResult
 from miles.rollout.sprout.rafo_role import KIND_REFLECT, KIND_REPAIR, KIND_ROOT, METADATA_KEY, RafoRole
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.types import Sample
 
 TURN_CREDITS = ("subtree", "own")
-BASELINES = ("students", "none")
 METRICS = (
-    "turns",
-    "turns_trained",
-    "turns_leaked",
-    "turns_unverified",
-    "turns_noncanonical",
-    "turns_without_gain",
-    "chain_turns",
+    "events",
+    "nested_events",
+    "events_trained",
+    "events_without_gain",
+    "events_unchecked",
     "ppo_samples",
     "placeholders",
     "estimation_only",
     "ungradable",
-    "continuations_touching_tests",
 )
 
 
@@ -63,48 +51,35 @@ class RafoSettings:
     c: float  # the token normalizer of PPO samples
     c_h: float  # the token normalizer of reviewer turns
     turn_credit: str  # subtree | own
-    baseline: str  # students | none: what a reviewer turn's continuations are compared with
 
     def __post_init__(self) -> None:
         if not (self.c > 0 and self.c_h > 0):
             raise ValueError(f"RAFO's token normalizers must be positive, got c={self.c}, c_h={self.c_h}")
-        if self.turn_credit not in TURN_CREDITS or self.baseline not in BASELINES:
-            raise ValueError(f"turn credit {self.turn_credit!r} or baseline {self.baseline!r} is not RAFO's")
+        if self.turn_credit not in TURN_CREDITS:
+            raise ValueError(f"turn credit {self.turn_credit!r} is not RAFO's; expected one of {TURN_CREDITS}")
 
 
-class Denominators(NamedTuple):
-    roots: int  # M
-    groups: int  # G: continuation groups
-    turns: int  # T: reviewer turns
+class Coefficients(NamedTuple):
+    root: float  # 1/(M C)
+    repair: float  # 1/(S K C)
+    reflect: float  # 1/(S C_h), for each unit of a turn's w
 
 
-def denominators(spec: SearchSpec) -> Denominators:
-    """The most of each that a search can make for one task; every root failed (FF) or all but one (TF)."""
-    every_root_failed = spec.roots * spec.points * (1 + spec.candidates * spec.repair_rounds)
-    all_but_one = (spec.roots - 1) * spec.points * int(spec.tf_student_continuations > 0)
-    turns = spec.roots * spec.points * spec.candidates * spec.repair_rounds
-    return Denominators(roots=spec.roots, groups=max(every_root_failed, all_but_one, 1), turns=max(turns, 1))
+def coefficients(spec: RafoSearchSpec, settings: RafoSettings) -> Coefficients:
+    """RAFO's fixed coefficients: constants of the search and the settings."""
+    return Coefficients(
+        root=1.0 / (spec.roots * settings.c),
+        repair=1.0 / (spec.events * spec.continuations * settings.c),
+        reflect=1.0 / (spec.events * settings.c_h),
+    )
 
 
 @dataclass(frozen=True)
 class _Row:
-    member: SearchMember
+    member: Member
     role: RafoRole
     turn: int | None = None  # a CE row: the message index of the reviewer turn it trains
     weight: float | None = None  # a CE row: the turn's w
-
-
-@dataclass(frozen=True)
-class _Turn:
-    """One reviewer turn: the gradable continuations after it, and where it was inserted."""
-
-    group: str
-    point_id: str
-    round: int
-    continuations: tuple[SearchMember, ...]
-    position: int  # its message index in its continuations
-    host: tuple[int, int] | None  # (turn, continuation) of the repair it was inserted in, for a later round
-    gate: str | None  # leaked | unverified | noncanonical
 
 
 def assemble_rafo_group(
@@ -112,37 +87,27 @@ def assemble_rafo_group(
     slot_samples: Mapping[str, Sample],
     mask_generator: MultiTurnLossMaskGenerator,
     *,
-    spec: SearchSpec,
+    spec: RafoSearchSpec,
     settings: RafoSettings,
     weight_version: int | None,
     indices: Iterator[int],
 ) -> tuple[list[Sample], dict[str, float]]:
-    """A search group's trajectories -> the samples the RAFO loss trains, each with its ``RafoRole``."""
+    """A RAFO search group's trajectories -> the samples the RAFO loss trains, each with its ``RafoRole``."""
     counts = dict.fromkeys(METRICS, 0) | {f"cases/{label}": 0 for label in OUTCOMES}
     if result.status == "failed" and not result.trajectories:
         counts[f"cases/{search_outcome(spec.roots, 0, 0)}"] = 1  # every root's actor failed
         return [], _metric_names(counts)
-    check_group(result, slot_samples)
-    members = [search_member(trajectory) for trajectory in result.trajectories]
-    case = checked_outcome(members, spec.roots)
-    gradable = [member for member in members if member.gradable]
-    counts.update(
-        {
-            f"cases/{case}": 1,
-            "ungradable": len(members) - len(gradable),
-            "continuations_touching_tests": sum(member.touching for member in members),
-        }
-    )
-    sizes = denominators(spec)
-    turns = _turns(gradable)
-    weights = _turn_weights(turns, gradable, settings)
-    rows = _ppo_rows(gradable, case, spec, sizes, settings)
-    rows += _ce_rows(turns, weights, sizes, settings, counts)
+    forest = read_forest(result, slot_samples, spec)
+    coefs = coefficients(spec, settings)
+    members = [*forest.roots, *(member for event in forest.events for member in event.continuations)]
+    counts.update({f"cases/{forest.case}": 1, "ungradable": sum(not member.gradable for member in members)})
+    weights = event_weights(forest.events, credit=settings.turn_credit)
+    rows = _ppo_rows(forest, coefs) + _ce_rows(forest.events, weights, coefs, counts)
     task = _Task(result, slot_samples, mask_generator, weight_version, _task_group_index(slot_samples))
     samples = [sample for row in rows if (sample := _render(task, row, indices, counts)) is not None]
     if not samples:
-        samples = _placeholder(task, gradable, counts)
-    root_values = [member.value for member in gradable if member.kind == "root"]
+        samples = _placeholder(task, forest.roots, counts)
+    root_values = [member.value for member in forest.roots if member.gradable]
     for sample in samples:
         _annotate_task(sample, task, root_success=sum(root_values) / len(root_values) if root_values else 0.0)
     return samples, _metric_names(counts)
@@ -156,109 +121,55 @@ def rloo(values: list[float]) -> list[float]:
     return [value - (total - value) / (len(values) - 1) for value in values]
 
 
-def _ppo_rows(
-    gradable: list[SearchMember], case: str, spec: SearchSpec, sizes: Denominators, settings: RafoSettings
-) -> list[_Row]:
-    """Each condition's gradable trajectories with a nonzero local RLOO advantage."""
-    groups: dict[str, list[SearchMember]] = {}
-    for member in gradable:
-        groups.setdefault(member.trajectory.group, []).append(member)
+def event_weights(events: tuple[Event, ...], *, credit: str) -> list[float]:
+    """w of each event's turn: the mean over its gradable continuations of R, or under ``subtree`` credit
+    of max(R, w_u) for each event u inside that continuation. Without a gradable continuation, 0."""
+    if credit not in TURN_CREDITS:
+        raise ValueError(f"unknown reviewer-turn credit {credit!r}; expected one of {TURN_CREDITS}")
+    inside: dict[str, list[int]] = {}  # a trajectory's branch id -> the events whose turn went into it
+    for index, event in enumerate(events):
+        inside.setdefault(event.parent, []).append(index)
+    weights = [0.0] * len(events)
+    for index in sorted(range(len(events)), key=lambda i: -events[i].depth):  # an event before the one it is in
+        credits = []
+        for member in events[index].gradable:
+            rescues = inside.get(member.trajectory.branch_id, []) if credit == "subtree" else []
+            credits.append(max([member.value, *(weights[u] for u in rescues)]))
+        weights[index] = sum(credits) / len(credits) if credits else 0.0
+    return weights
+
+
+def _ppo_rows(forest: Forest, coefs: Coefficients) -> list[_Row]:
+    """The task's roots, and each event's continuations: the gradable members with a nonzero local RLOO."""
+    groups = [(KIND_ROOT, coefs.root, forest.roots)]
+    groups += [(KIND_REPAIR, coefs.repair, event.continuations) for event in forest.events]
     rows = []
-    for group_members in groups.values():
-        if len(group_members) < 2:
+    for kind, coef, members in groups:
+        gradable = [member for member in members if member.gradable]
+        if len(gradable) < 2:
             continue  # nothing to compare with: no PPO signal
-        kind, coef = _ppo_coefficient(group_members[0].kind, case, spec, sizes, settings)
-        advantages = rloo([member.value for member in group_members])
+        advantages = rloo([member.value for member in gradable])
         rows += [
             _Row(member, RafoRole(kind=kind, adv=adv, coef=coef))
-            for member, adv in zip(group_members, advantages, strict=True)
+            for member, adv in zip(gradable, advantages, strict=True)
             if adv != 0
         ]
     return rows
 
 
-def _ppo_coefficient(
-    kind: str, case: str, spec: SearchSpec, sizes: Denominators, settings: RafoSettings
-) -> tuple[str, float]:
-    if kind == "root":
-        return KIND_ROOT, 1.0 / (sizes.roots * settings.c)
-    if kind == "student":
-        planned = spec.student_continuations if case == "FF" else spec.tf_student_continuations
-    else:
-        planned = spec.candidate_continuations
-    return KIND_REPAIR, 1.0 / (sizes.groups * max(planned, 1) * settings.c)
-
-
-def _turns(gradable: list[SearchMember]) -> list[_Turn]:
-    """The reviewer turns, by the repair condition of their continuations, with the repair each later round's
-    turn was inserted in (``chain_parent_job_id``, the job of that repair)."""
-    groups: dict[str, list[SearchMember]] = {}
-    for member in gradable:
-        if member.kind == "repair":
-            groups.setdefault(member.trajectory.group, []).append(member)
-    hosts = {
-        member.trajectory.branch_id: (turn, cont)
-        for turn, group_members in enumerate(groups.values())
-        for cont, member in enumerate(group_members)
-    }
-    turns = []
-    for group, group_members in groups.items():
-        search = group_members[0].trajectory.metadata["search"]
-        round_no = search.get("round", 1)
-        candidate = search_candidate(group_members)
-        gate = "leaked" if candidate.leaked else "unverified" if candidate.unverified else None
-        gate = gate or ("noncanonical" if candidate.noncanonical else None)
-        turns.append(
-            _Turn(
-                group=group,
-                point_id=group_members[0].point_id,
-                round=round_no,
-                continuations=tuple(group_members),
-                position=max(group_members[0].trajectory.metadata["provenance"]["inserted_messages"]),
-                host=hosts.get(search.get("chain_parent_job_id")) if round_no > 1 else None,
-                gate=gate,
-            )
-        )
-    return turns
-
-
-def _turn_weights(turns: list[_Turn], gradable: list[SearchMember], settings: RafoSettings) -> list[float]:
-    """w of each turn, the later rounds first so that subtree credit can reach back along the chain."""
-    students: dict[str, list[float]] = {}
-    for member in gradable:
-        if member.kind == "student":
-            students.setdefault(member.point_id, []).append(member.value)
-    rescues: dict[tuple[int, int], list[int]] = {}
-    for index, turn in enumerate(turns):
-        if turn.host is not None:
-            rescues.setdefault(turn.host, []).append(index)
-    weights = [0.0] * len(turns)
-    for index in sorted(range(len(turns)), key=lambda i: -turns[i].round):
-        turn = turns[index]
-        credits = []
-        for cont, member in enumerate(turn.continuations):
-            rescued = [weights[child] for child in rescues.get((index, cont), [])]
-            credits.append(max([member.value, *rescued]) if settings.turn_credit == "subtree" else member.value)
-        at_point = students.get(turn.point_id, []) if turn.round == 1 and settings.baseline == "students" else []
-        baseline = sum(at_point) / len(at_point) if at_point else 0.0
-        weights[index] = 0.0 if turn.gate else max(0.0, sum(credits) / len(credits) - baseline)
-    return weights
-
-
 def _ce_rows(
-    turns: list[_Turn], weights: list[float], sizes: Denominators, settings: RafoSettings, counts: dict[str, int]
+    events: tuple[Event, ...], weights: list[float], coefs: Coefficients, counts: dict[str, int]
 ) -> list[_Row]:
     rows = []
-    for turn, weight in zip(turns, weights, strict=True):
-        counts["turns"] += 1
-        counts["chain_turns"] += turn.round > 1
-        if turn.gate:
-            counts[f"turns_{turn.gate}"] += 1
-        elif weight == 0:
-            counts["turns_without_gain"] += 1
-        else:
-            role = RafoRole(kind=KIND_REFLECT, adv=0.0, coef=weight / (sizes.turns * settings.c_h))
-            rows.append(_Row(turn.continuations[0], role, turn=turn.position, weight=weight))
+    for event, weight in zip(events, weights, strict=True):
+        counts["events"] += 1
+        counts["nested_events"] += event.depth > 1
+        counts["events_unchecked"] += event.unchecked
+        if weight == 0:
+            counts["events_without_gain"] += 1
+            continue
+        role = RafoRole(kind=KIND_REFLECT, adv=0.0, coef=weight * coefs.reflect)
+        rows.append(_Row(event.gradable[0], role, turn=event.turn, weight=weight))
     return rows
 
 
@@ -283,7 +194,7 @@ def _render(task: _Task, row: _Row, indices: Iterator[int], counts: dict[str, in
     trajectory = row.member.trajectory
     slot = task.slot_samples[trajectory.sample_slot_id]
     if row.role.kind == KIND_REFLECT:
-        sample = ahat_sample(
+        sample = turn_sample(
             trajectory,
             slot,
             task.mask_generator,
@@ -293,7 +204,7 @@ def _render(task: _Task, row: _Row, indices: Iterator[int], counts: dict[str, in
             turn=row.turn,
         )
         if sample is not None:
-            counts["turns_trained"] += 1
+            counts["events_trained"] += 1
     else:
         sample = import_trajectory(
             task.result, trajectory, slot, task.mask_generator, weight_version=task.weight_version
@@ -310,10 +221,10 @@ def _render(task: _Task, row: _Row, indices: Iterator[int], counts: dict[str, in
     return sample
 
 
-def _placeholder(task: _Task, gradable: list[SearchMember], counts: dict[str, int]) -> list[Sample]:
+def _placeholder(task: _Task, roots: tuple[Member, ...], counts: dict[str, int]) -> list[Sample]:
     """One zero-weight root, so that the task counts in the step it adds no gradient to."""
-    for member in gradable:
-        if member.kind != "root":
+    for member in roots:
+        if not member.gradable:
             continue
         row = _Row(member, RafoRole(kind=KIND_ROOT, adv=0.0, coef=0.0))
         if (sample := _render(task, row, iter(()), counts)) is not None:

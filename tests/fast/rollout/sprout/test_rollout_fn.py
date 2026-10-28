@@ -12,7 +12,7 @@ from tests.fast.rollout.sprout.conftest import args, group, sprout_request, spro
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnEvalInput, RolloutFnTrainInput
 from miles.rollout.sprout.client import SproutDriverError, SproutRolloutClient
 from miles.rollout.sprout.protocol import RolloutRequest, RolloutResult
-from miles.rollout.sprout.rollout_fn import GSML_POST_PROCESS, SproutRolloutFn, collect_metrics
+from miles.rollout.sprout.rollout_fn import RAFO_LOSS, SproutRolloutFn, collect_metrics
 from miles.utils.types import Sample
 
 
@@ -97,6 +97,7 @@ def test_model_name_prefers_the_served_name():
         ({"skip_actor_forward_only": True}, "incompatible with retokenized"),
         ({"use_tis": True}, "incompatible with retokenized"),
         ({"use_rollout_routing_replay": True}, "incompatible with retokenized"),
+        ({"use_rollout_indexer_replay": True}, "incompatible with retokenized"),
         ({"use_sampling_support_replay": True}, "rollout-top-k\\) is incompatible with retokenized"),
         ({"compute_advantages_and_returns": False}, "advantage path"),
         ({"rollout_stop_token_ids": [7]}, "stop token ids"),
@@ -106,7 +107,7 @@ def test_model_name_prefers_the_served_name():
         ({"sprout_rollout_timeout_seconds": 0}, "finite and positive"),
         ({"sprout_rollout_poll_interval_seconds": float("nan")}, "finite and positive"),
         ({"n_samples_per_prompt": 0}, "positive integer"),
-        ({"custom_reward_post_process_path": GSML_POST_PROCESS}, "credits search groups only"),
+        ({"loss_type": "custom_loss", "custom_loss_function_path": RAFO_LOSS}, "set --sprout-rollout-rafo"),
     ],
 )
 def test_configuration_that_cannot_be_honoured_is_refused_at_construction(updates, message):
@@ -415,13 +416,21 @@ def test_miles_parser_exposes_the_sprout_flags_once_the_function_is_selected():
         parsed.sprout_rollout_timeout_seconds == 3600.0
         and parsed.sprout_rollout_finalization_timeout_seconds == 1800.0
     )
-    assert parsed.sprout_rollout_search_tf_student_continuations == 2
-    gsml = {k.removeprefix("sprout_rollout_gsml_"): v for k, v in vars(parsed).items() if "_gsml_" in k}
-    assert gsml == {"lambda": 0.4, "beta_branch": 1.0, "psi": 1.0, "c_pre": 0.0, "kappa_plus": 0.0}
-    removed = ("branch_advantage_scale", "distill_weight", "difficulty_beta")
+    rafo = {k.removeprefix("sprout_rollout_rafo_"): v for k, v in vars(parsed).items() if "_rafo_" in k}
+    assert parsed.sprout_rollout_rafo is False and rafo == {
+        "continuations": 2,
+        "depth": 3,
+        "events": 4,
+        "review_seconds": 3600.0,
+        "wall_time_seconds": 3600.0,
+        "c": 64.0,
+        "c_h": 32.0,
+        "turn_credit": "subtree",
+    }
+    removed = ("search_points", "credit", "gsml_lambda", "distill_weight")
     assert not any(hasattr(parsed, f"sprout_rollout_{name}") for name in removed)
-    _, unknown = parser.parse_known_args([*argv, "--sprout-rollout-distill-weight", "0.5"])
-    assert unknown == ["--sprout-rollout-distill-weight", "0.5"], "the legacy credit flags are gone"
+    _, unknown = parser.parse_known_args([*argv, "--sprout-rollout-search-points", "1"])
+    assert unknown == ["--sprout-rollout-search-points", "1"], "the hindsight search and GSML flags are gone"
     given = {k: v for k, v in vars(parsed).items() if k.startswith("sprout_") and v is not None}
     fn = construct(Namespace(**{**vars(args()), **given}))
     request, _ = fn._build_request(group=group(), rollout_id=0)

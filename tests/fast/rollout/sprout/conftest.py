@@ -1,14 +1,14 @@
 """Shared pieces for the Sprout rollout tests.
 
-The two JSON fixtures are copies of the examples Sprout ships beside its RL
-driver (``src/sprout/rl_driver/request.example.json`` and
-``result.example.json``): what Miles must send, and what it receives back.
-``search_result`` builds the result of a search group the way Sprout
-annotates one.
+The JSON fixtures are byte copies of the examples Sprout ships in its
+``examples/rl_driver/`` (``SPROUT_EXAMPLES``): the request Miles must send, the
+result of a group without a search, and the result of a RAFO search.
+``forest_result`` builds the result of a RAFO search the way Sprout annotates
+one.
 """
 
-import itertools
 import json
+import os
 from argparse import Namespace
 from copy import deepcopy
 from pathlib import Path
@@ -17,14 +17,17 @@ import pytest
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
-from miles.rollout.sprout.gsml import assemble_search_group, search_outcome
-from miles.rollout.sprout.protocol import RolloutResult
-from miles.utils.args.custom_function import CustomFunctionConfig
-from miles.utils.args.custom_view import ImmutableNamespace
+from miles.rollout.sprout.forest import search_outcome
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.types import Sample
 
 FIXTURES = Path(__file__).parent / "fixtures"
+#: Each fixture and the example in Sprout's ``examples/rl_driver/`` that it copies byte for byte.
+SPROUT_EXAMPLES = {
+    "sprout_request.example.json": "request.example.json",
+    "sprout_result.example.json": "result.example.json",
+    "sprout_rafo_search_result.example.json": "rafo_search_result.example.json",
+}
 
 WORDS = [
     "<unk>",
@@ -122,12 +125,25 @@ def args(**updates) -> Namespace:
         "use_rollout_logprobs": False,
         "skip_actor_forward_only": False,
         "use_tis": False,
+        "use_rollout_routing_replay": False,
+        "use_rollout_indexer_replay": False,
+        "use_sampling_support_replay": False,
+        "train_backend": "megatron",
+        "rewards_normalization": True,
+        "custom_reward_post_process_path": None,
+        "use_dynamic_global_batch_size": False,
         "compute_advantages_and_returns": True,
-        "sprout_rollout_credit": "gsml",
+        "loss_type": "policy_loss",
+        "custom_loss_function_path": None,
+        "sprout_rollout_rafo": False,
+        "sprout_rollout_rafo_continuations": 2,
+        "sprout_rollout_rafo_depth": 3,
+        "sprout_rollout_rafo_events": 4,
+        "sprout_rollout_rafo_review_seconds": 5.0,
+        "sprout_rollout_rafo_wall_time_seconds": 7.0,
         "sprout_rollout_rafo_c": 64.0,
         "sprout_rollout_rafo_c_h": 32.0,
         "sprout_rollout_rafo_turn_credit": "subtree",
-        "sprout_rollout_rafo_baseline": "students",
     }
     return Namespace(**{**fields, **updates})
 
@@ -147,7 +163,7 @@ def group(size: int = 1, *, group_index: int = 3, first_index: int = 11) -> list
     ]
 
 
-#: The parent's history a branch restores: three messages, none of them the branch's own.
+#: The history that an event of depth 1 restores: three messages, none of them its own.
 PREFIX = [
     {"role": "user", "content": "fix task"},
     {
@@ -159,58 +175,85 @@ PREFIX = [
     },
     {"role": "tool", "tool_call_id": "parent-1", "content": "/workspace"},
 ]
-#: A reviewer's turn as Sprout inserts it in a repair continuation: its text as
-#: the reasoning, the content empty (``assistant_turn_rendering`` "reasoning").
-INSERTED_TURN = {
-    "role": "assistant",
-    "content": "",
-    "reasoning_content": "parser broken",
-    "tool_calls": [
-        {"id": "inserted-1", "type": "function", "function": {"name": "shell", "arguments": '{"command":"ls"}'}}
-    ],
-}
+#: The reasoning of each event's turn, by event number.
+TURNS = {1: "parser broken", 2: "inspect tests", 3: "tests pass", 4: "inspect parser"}
 #: A slot whose actor failed: Sprout names it in ``failed_samples``, with no trajectory.
 LOST = "lost"
 
 
-def search_result(roots: list, points: dict | None = None) -> tuple[dict, dict[str, Sample]]:
-    """A search group's result body, annotated the way Sprout annotates one, and the slots Miles allocated.
+def inserted_turn(event: int) -> dict:
+    """The turn of ``event`` as Sprout inserts it in a continuation: the reviewer's text as the reasoning,
+    the content empty (``assistant_turn_rendering`` "reasoning"), then the check's command."""
+    call = {
+        "id": f"inserted-{event}",
+        "type": "function",
+        "function": {"name": "shell", "arguments": '{"command":"ls"}'},
+    }
+    return {"role": "assistant", "content": "", "reasoning_content": TURNS[event], "tool_calls": [call]}
 
-    ``roots`` holds each root's reward in slot order; ``points`` maps a point id
-    to ``{"students": rewards, "candidates": [rewards of each candidate]}``. A
-    reward of None is a trajectory whose grade gave no verdict, ``LOST`` a slot
-    whose actor failed. Every repair continuation is canonical, leaks nothing
-    and touched no test; tests edit the body for anything else.
+
+#: The turn of event 1.
+INSERTED_TURN = inserted_turn(1)
+
+
+def forest_result(roots: list, events: list | None = None) -> tuple[dict, dict[str, Sample]]:
+    """A RAFO search's result body, annotated the way Sprout annotates one, and the slots Miles allocated.
+
+    ``roots`` holds each root's reward in slot order. ``events`` holds each event, numbered from 1 in
+    the order given, as ``(parent, rewards)``: ``parent`` is where its turn went, ``"root:<i>"`` for
+    the i-th root or ``"event:<n>:<j>"`` for the j-th continuation of event n (both from 0), and
+    ``rewards`` are its continuations' in slot order. A reward of None is a trajectory whose grade gave
+    no verdict, ``LOST`` a slot whose actor failed. Every turn is in reasoning form and checked clean.
     """
     graded = [reward for reward in roots if reward not in (None, LOST)]
     counts = {"planned": len(roots), "graded": len(graded), "resolved": int(sum(graded))}
     outcome = search_outcome(**counts)
     samples = group(len(roots), group_index=3, first_index=11)
     slots = {f"job:slot:{sample.index}": sample for sample in samples}
-    planned = [("root", {"kind": "root"}, reward) for reward in roots]
-    for point, (point_id, branches) in enumerate((points or {}).items(), 1):
+    template = sprout_result()["trajectories"][0]
+    planned = [
+        (None, "root", [*template["messages"][:3]], {"prefix_messages": 0, "inserted_messages": []}, reward)
+        for reward in roots
+    ]
+    # Where each event's continuations stand: (branch id, history up to the turn, inserted turns, depth).
+    continuations: dict[tuple[int, int], tuple[str, list, list, int]] = {}
+    for number, (parent, rewards) in enumerate(events or [], 1):
+        kind, *where = parent.split(":")
+        if kind == "root":
+            parent_id, prefix, inserted, depth = f"job-{11 + int(where[0])}", PREFIX, [], 1
+        else:
+            parent_id, history, inserted, depth = continuations[(int(where[0]), int(where[1]))]
+            # The parent's history to the end of the check, and a step of its own, restored at its point.
+            step = {"id": f"own-{parent_id}", "type": "function", "function": {"name": "shell", "arguments": "{}"}}
+            prefix = [
+                *history,
+                {"role": "assistant", "content": "inspect", "tool_calls": [step]},
+                {"role": "tool", "tool_call_id": step["id"], "content": "tests"},
+            ]
+            depth += 1
+        history = [
+            *deepcopy(prefix),
+            inserted_turn(number),
+            {"role": "tool", "tool_call_id": f"inserted-{number}", "content": "tests"},
+        ]
         about = {
-            "kind": "student",
-            "point": point,
-            "point_id": point_id,
+            "kind": "repair",
+            "event": number,
+            "depth": depth,
+            "parent_job_id": parent_id,
+            "point_id": f"{parent_id}-step2",
             "step": 2,
             "message_step": 1,
-            "parent_job_id": "job-11",
+            "leak_terms": [],
+            "assistant_turn_rendering": "reasoning",
         }
-        planned += [(f"student:{point_id}", about, reward) for reward in branches.get("students", [])]
-        for candidate, rewards in enumerate(branches.get("candidates", []), 1):
-            repair = {
-                **about,
-                "kind": "repair",
-                "candidate": candidate,
-                "multiplicity": 1,
-                "samples": None,
-                "leak_terms": [],
-                "assistant_turn_rendering": "reasoning",
-            }
-            planned += [(f"repair:{point_id}:{candidate}", repair, reward) for reward in rewards]
+        provenance = {"prefix_messages": len(prefix), "inserted_messages": [*inserted, len(prefix)]}
+        first = 11 + len(planned)
+        for j in range(len(rewards)):
+            continuations[(number, j)] = (f"job-{first + j}", history, provenance["inserted_messages"], depth)
+        planned += [((parent_id, about), f"event:{number}", history, provenance, reward) for reward in rewards]
     trajectories, failed = [], []
-    for index, (condition, about, reward) in enumerate(planned, 11):
+    for index, (branch, condition, history, provenance, reward) in enumerate(planned, 11):
         slot = f"job:slot:{index}"
         if slot not in slots:
             slots[slot] = deepcopy(samples[0])
@@ -218,8 +261,10 @@ def search_result(roots: list, points: dict | None = None) -> tuple[dict, dict[s
         if reward == LOST:
             failed.append({"sample_slot_id": slot, "reason": "Actor did not complete"})
             continue
+        about = {"kind": "root"} if branch is None else branch[1]
         search = {**about, "outcome": outcome, "root_counts": dict(counts)}
-        trajectories.append(_trajectory(slot, index, condition, search, reward))
+        parent = None if branch is None else branch[0]
+        trajectories.append(_trajectory(slot, index, condition, history, provenance, search, parent, reward))
     body = {
         **sprout_result(),
         "rollout_job_id": "job",
@@ -233,16 +278,18 @@ def search_result(roots: list, points: dict | None = None) -> tuple[dict, dict[s
     return body, slots
 
 
-def _trajectory(slot: str, index: int, condition: str, search: dict, reward: float | None) -> dict:
+def _trajectory(
+    slot: str,
+    index: int,
+    condition: str,
+    history: list,
+    provenance: dict,
+    search: dict,
+    parent: str | None,
+    reward: float | None,
+) -> dict:
     template = sprout_result()["trajectories"][0]
     own = {"role": "assistant", "content": "fixed" if reward == 1 else "done"}
-    if condition == "root":
-        messages, provenance = [*template["messages"][:3], own], {"prefix_messages": 0, "inserted_messages": []}
-    elif condition.startswith("student:"):
-        messages, provenance = [*PREFIX, own], {"prefix_messages": 3, "inserted_messages": []}
-    else:
-        tool = {"role": "tool", "tool_call_id": "inserted-1", "content": "tests"}
-        messages, provenance = [*PREFIX, INSERTED_TURN, tool, own], {"prefix_messages": 3, "inserted_messages": [3]}
     graded = reward is not None
     metadata = {
         **template["metadata"],
@@ -259,9 +306,9 @@ def _trajectory(slot: str, index: int, condition: str, search: dict, reward: flo
             **template,
             "sample_slot_id": slot,
             "branch_id": f"job-{index}",
-            "parent_branch_id": None if condition == "root" else "job-11",
+            "parent_branch_id": parent,
             "group": condition,
-            "messages": messages,
+            "messages": [*history, own],
             "reward": float(reward) if graded else 0.0,
             "metadata": metadata,
         }
@@ -273,52 +320,13 @@ def members(body: dict, condition: str) -> list[dict]:
     return [trajectory for trajectory in body["trajectories"] if trajectory["group"] == condition]
 
 
-def ff_example() -> tuple[dict, dict[str, Sample]]:
-    """The shared FF example: both roots fail. At P1 a student resolves; at P2 none does, candidate 1's
-    continuations both resolve and candidate 2's turn names a hidden test file."""
-    body, slots = search_result(
-        [0.0, 0.0],
-        {
-            "p1": {"students": [1.0, 0.0], "candidates": [[1.0, 0.0], [0.0, 0.0]]},
-            "p2": {"students": [0.0, 0.0], "candidates": [[1.0, 1.0], [1.0, 0.0]]},
-        },
-    )
-    for trajectory in members(body, "repair:p2:2"):
-        trajectory["metadata"]["search"]["leak_terms"] = ["tests/test_hidden.py"]
-    return body, slots
-
-
-def gsml_args(**updates) -> Namespace:
-    """The flags ``post_process_gsml`` reads, at the values of the shared example (λ 0.4, β_br = ψ = 1)."""
-    fields = {
-        "sprout_rollout_gsml_lambda": 0.4,
-        "sprout_rollout_gsml_beta_branch": 1.0,
-        "sprout_rollout_gsml_psi": 1.0,
-        "sprout_rollout_gsml_c_pre": 0.0,
-        "sprout_rollout_gsml_kappa_plus": 0.0,
-        "reward_key": None,
-    }
-    return Namespace(**{**fields, **updates})
-
-
-def trainer_view(namespace: Namespace) -> ImmutableNamespace:
-    """The arguments as the trainer's reward post-process sees them: a typed view whose post-process path is a
-    custom function (``_post_process_rewards`` builds the function's config view from it)."""
-    values = vars(namespace)
-    path = values.get("custom_reward_post_process_path")
-    return ImmutableNamespace(
-        **{**values, "custom_reward_post_process_path": None if path is None else CustomFunctionConfig(path=path)}
-    )
-
-
-def assemble(mask_generator, body: dict, slots: dict[str, Sample], *, planned_roots: int = 2):
-    """``assemble_search_group`` on a result body, with fresh identities after every slot's."""
-    return assemble_search_group(
-        RolloutResult.model_validate(body),
-        slots,
-        mask_generator,
-        planned_roots=planned_roots,
-        weight_version=7,
-        indices=itertools.count(100),
-        group_indices=itertools.count(50),
-    )
+def sprout_examples() -> Path | None:
+    """Sprout's ``examples/rl_driver``: of ``$SPROUT_REPO``, else of a checkout beside this one; None without."""
+    configured = os.environ.get("SPROUT_REPO")
+    siblings = Path(__file__).resolve().parents[5]  # the directory holding this checkout
+    for checkout in [Path(configured)] if configured else [siblings / "sprout", siblings / "SPROUT"]:
+        if (checkout / "examples" / "rl_driver").is_dir():
+            return checkout / "examples" / "rl_driver"
+    if configured:
+        pytest.fail(f"SPROUT_REPO={configured} is not a Sprout checkout")
+    return None

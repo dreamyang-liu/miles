@@ -44,58 +44,39 @@ class Budget(FrozenStrictBaseModel):
     max_wall_time_seconds: float = Field(strict=True, gt=0, allow_inf_nan=False)
 
 
-class SearchSpec(FrozenStrictBaseModel):
-    """Hindsight branches after the roots (Sprout's ``rl_driver.messages.SearchSpec``).
+class RafoSearchSpec(FrozenStrictBaseModel):
+    """RAFO's forest after the roots (Sprout's ``sprout.search.spec.RafoSearchSpec``).
 
-    ``roots`` scratch rollouts take the first slots. Once they are graded, the
-    task's outcome (``gsml.search_outcome``) decides what Sprout samples next.
-    Every graded root resolved, or none was graded: nothing. Some resolved
-    (TF), or none did but one is missing (FF_partial): a review of each failed
-    root picks up to ``points`` branch points in it, and
-    ``tf_student_continuations`` branches with nothing added run from each (0:
-    none). Every root was graded and none resolved (FF): the review also writes
-    ``candidates`` repair turns per point, and ``student_continuations``
-    branches with nothing added and ``candidate_continuations`` after each
-    repair run from it. Under FF the repairs come in up to ``repair_rounds``
-    rounds: where no student and no repair has resolved, the failed repair of
-    the last round is reviewed again and one more turn inserted later in its
-    own history; more than one round takes one candidate and one continuation
-    per round. The branches fill the remaining slots, enough for the outcome
-    that makes the most (``branches()``).
+    ``roots`` scratch rollouts take the first slots. Only when no graded root
+    resolved does Sprout review: at one point of each failed root, at most
+    ``events`` of them, a reviewer writes one turn in the agent's own voice
+    that exposes the problem with a check and never fixes it, and
+    ``continuations`` branches restored at the point run after the turn: one
+    event. When every graded continuation of an event failed, the next depth
+    reviews the first of them in the same way, while events are left, up to
+    ``depth``. The branches fill the slots after the roots, ``branches()`` of
+    them.
     """
 
+    mode: Literal["rafo"] = "rafo"
     roots: StrictInt = Field(gt=0)
-    points: StrictInt = Field(gt=0)
-    candidates: StrictInt = Field(ge=0)
-    student_continuations: StrictInt = Field(gt=0)
-    candidate_continuations: StrictInt = Field(ge=0)
-    tf_student_continuations: StrictInt = Field(ge=0)
-    repair_rounds: StrictInt = Field(gt=0)
+    continuations: StrictInt = Field(gt=0)
+    depth: StrictInt = Field(gt=0)
+    events: StrictInt = Field(gt=0)
     review_seconds: float = Field(strict=True, gt=0, allow_inf_nan=False)
     wall_time_seconds: float = Field(strict=True, gt=0, allow_inf_nan=False)
 
-    @model_validator(mode="after")
-    def validate_search(self) -> SearchSpec:
-        if (self.candidates == 0) != (self.candidate_continuations == 0):
-            raise ValueError("candidates and candidate_continuations are both zero or both positive")
-        if self.repair_rounds > 1 and (self.candidates, self.candidate_continuations) != (1, 1):
-            raise ValueError("more than one repair round takes one candidate and one candidate continuation")
-        return self
-
     def branches(self) -> int:
-        """The most the search may make, ``points`` in each failed root: all of them failed (FF), or all
-        but one (TF, FF_partial). Sprout computes the same number and refuses fewer slots."""
-        every_root_failed = self.roots * (
-            self.student_continuations + self.candidates * self.candidate_continuations * self.repair_rounds
-        )
-        all_but_one = (self.roots - 1) * self.tf_student_continuations
-        return self.points * max(every_root_failed, all_but_one)
+        """The most branches the search may make: ``continuations`` after each of its ``events`` turns.
+        Sprout computes the same number and refuses fewer slots."""
+        return self.events * self.continuations
 
     def search_seconds(self, grade_seconds: float) -> float:
-        """How long the search may run after its roots: each round's review and branches, and the grades
-        of every round but the last (Sprout's ``SearchSpec.search_seconds``)."""
-        rounds = self.repair_rounds if self.candidates else 1
-        return rounds * (self.review_seconds + self.wall_time_seconds) + (rounds - 1) * grade_seconds
+        """How long the search may run after its roots: each depth's review and continuations, and the
+        grades of every depth but the last (Sprout's ``RafoSearchSpec.search_seconds``). A depth needs an
+        event of its own, so at most ``events`` depths run."""
+        depths = min(self.depth, self.events)
+        return depths * (self.review_seconds + self.wall_time_seconds) + (depths - 1) * grade_seconds
 
 
 class RolloutRequest(FrozenStrictBaseModel):
@@ -117,7 +98,7 @@ class RolloutRequest(FrozenStrictBaseModel):
     finalization_timeout_seconds: float = Field(default=1800.0, strict=True, gt=0, allow_inf_nan=False)
     sampling_params: dict[str, Any] = Field(default_factory=dict)
     budgets: Budget
-    search: SearchSpec | None = None
+    search: RafoSearchSpec | None = None
 
     @model_validator(mode="after")
     def validate_request(self) -> RolloutRequest:
@@ -163,25 +144,23 @@ class Trajectory(FrozenStrictBaseModel):
       not (``grade_no_verdict``, ``grade_failed``, ...). Such a trajectory is
       missing: its ``reward`` is 0.0 only because the wire needs a number, and
       a search credits it nothing and counts it in no statistic.
-    - ``touched_test_paths``: the task's test files the graded patch changed
-      (None when unknown). A repair continuation that touched any, or cannot
-      say, counts as unresolved in GSML (R' = 0).
-    - ``search``, for a search request: ``kind`` (root, student or repair) and
-      the task's ``outcome`` and ``root_counts``, which must match Miles's own;
-      a branch's ``point_id``; a repair's ``candidate`` and ``leak_terms``,
-      the hidden test names and paths its inserted turn names that its history
-      did not show (None: there was nothing to check it against).
+    - ``search``, for a RAFO search: ``kind`` (``root``, or ``repair`` for a
+      continuation) and the task's ``outcome`` and ``root_counts``, which must
+      match Miles's own; a continuation's ``event`` and ``depth`` and the
+      ``parent_job_id`` its event's turn went into (a root's or a
+      continuation's ``branch_id``), and ``leak_terms``, the hidden test names
+      its history's turns give away (None: there was nothing to check them
+      against).
 
-    GSML (``gsml.assemble_search_group``) refuses a search trajectory that
-    lacks what it reads.
+    ``forest.read_forest`` refuses a search trajectory that lacks what it reads.
     """
 
     sample_slot_id: NonEmptyStr
     branch_id: NonEmptyStr
     parent_branch_id: NonEmptyStr | None = None
     #: Which trajectories were sampled under one condition, for a search
-    #: request: ``root`` for the scratch rollouts, ``student:<point>`` and
-    #: ``repair:<point>:<candidate>`` for the branches; None without a search.
+    #: request: ``root`` for the scratch rollouts and ``event:<n>`` for the
+    #: continuations of event n; None without a search.
     group: NonEmptyStr | None = None
     messages: list[dict[str, Any]] = Field(min_length=1)
     tools: list[dict[str, Any]] = Field(default_factory=list)

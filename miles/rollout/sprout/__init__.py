@@ -7,10 +7,10 @@ returns every trajectory as hint-free Chat Completions messages with a 0/1
 reward. Miles retokenizes those messages, masks everything but the assistant
 turns and trains with its ordinary GRPO path. See ``rollout_fn.SproutRolloutFn``.
 
-With a hindsight search (``protocol.SearchSpec``) Sprout also branches from the
-points its review chose in the failed roots, and the group is credited by GSML
-instead: ``gsml.assemble_search_group`` gives each sample its credit and
-``rewards.post_process_gsml`` turns it into the advantage. Under
-``--sprout-rollout-credit rafo``, ``rafo.assemble_rafo_group`` gives each sample
-its RAFO role instead, which the RAFO loss trains.
+With ``--sprout-rollout-rafo`` each group is a RAFO search instead
+(``protocol.RafoSearchSpec``): where every root failed, Sprout's reviewer writes
+a turn that exposes the problem, continuations run after it, and deeper reviews
+follow in failed continuations. ``forest.read_forest`` reads the forest Sprout
+returns, ``rafo.assemble_rafo_group`` gives each sample its RAFO role
+(``rafo_role.RafoRole``), and the RAFO loss trains them.
 """

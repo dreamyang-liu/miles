@@ -20,8 +20,21 @@ from miles.utils.types import Sample
 
 SAMPLE_STATUS = {"completed": Sample.Status.COMPLETED, "truncated": Sample.Status.TRUNCATED}
 ROLES = {"system", "user", "assistant", "tool"}
-#: What a returned trajectory is in a search (``metadata.search.kind``); a root without one.
-SEARCH_KINDS = {"root", "student", "repair"}
+#: What a returned trajectory is in a RAFO search (``metadata.search.kind``): a root, or a continuation
+#: after a reviewer's turn. A root without a search has no kind.
+SEARCH_KINDS = {"root", "repair"}
+#: The reasoning of the inserted turn that ``check_reasoning_is_trained`` renders.
+REASONING_PROBE = "sprout reasoning probe"
+PROBE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a command.",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+        },
+    }
+]
 
 
 def import_trajectories(
@@ -33,7 +46,7 @@ def import_trajectories(
 ) -> list[Sample]:
     """One Miles sample per returned trajectory, in the slots Miles allocated."""
     if result.status == "failed" and not result.trajectories:
-        return []   # every slot's actor failed: nothing to train on (``validate_result`` decides if that is allowed)
+        return []  # every slot's actor failed: nothing to train on (``validate_result`` decides if that is allowed)
     if result.status not in {"completed", "early_stopped"}:
         raise ValueError(f"cannot import a rollout group with status={result.status!r}: {result.stop_reason}")
     if result.max_samples > len(slot_samples):
@@ -128,7 +141,7 @@ def import_trajectory(
 
     A branch whose own turns were all restored or inserted still tells what
     happened from its state, so a search counts its reward (it is
-    estimation-only, ``gsml.assemble_search_group``); there is nothing in it
+    estimation-only, ``rafo.assemble_rafo_group``); there is nothing in it
     to train.
     """
     messages = prepare_messages(trajectory)
@@ -141,7 +154,7 @@ def import_trajectory(
     lineage = {
         "rollout_job_id": result.rollout_job_id,
         "prompt_group_id": result.prompt_group_id,
-        # Its place in a search, which decides how it is credited (gsml.Credit).
+        # Its place in a search, which decides how it is credited (rafo.assemble_rafo_group).
         **_trajectory_lineage(
             trajectory, weight_version, stop_reason=trajectory.stop_reason, role=search["kind"] if search else "root"
         ),
@@ -157,7 +170,7 @@ def import_trajectory(
     )
 
 
-def ahat_sample(
+def turn_sample(
     trajectory: Trajectory,
     slot_sample: Sample,
     mask_generator: MultiTurnLossMaskGenerator,
@@ -167,10 +180,10 @@ def ahat_sample(
     weight_version: int | None,
     turn: int | None = None,
 ) -> Sample | None:
-    """A repair continuation's inserted turn as a one-turn target: GSML's â sample.
+    """A continuation's inserted reviewer turn as a one-turn target: RAFO's CE sample of the turn.
 
     ``turn`` is the message index of an inserted turn, by default the last
-    one (a repair chain inserts one per round). The context is the
+    one (a nested event's history holds one per depth). The context is the
     continuation's history up to that turn, as the policy would see it there;
     only the turn itself -- its reasoning and its calls -- is trained, with
     reward 1.0. None when the turn renders no trainable token.
@@ -178,7 +191,7 @@ def ahat_sample(
     unsampled_messages(trajectory)  # the provenance is checked before it is read
     inserted = trajectory.metadata["provenance"]["inserted_messages"]
     if not inserted:
-        raise ValueError(f"{trajectory.sample_slot_id!r} has no inserted turn to make an â sample of")
+        raise ValueError(f"{trajectory.sample_slot_id!r} has no inserted turn to make a turn sample of")
     if turn is None:
         turn = max(inserted)
     elif turn not in inserted:
@@ -187,13 +200,51 @@ def ahat_sample(
     for position, message in enumerate(messages):
         if message["role"] == "assistant" and position != turn:
             message["step_loss_mask"] = 0
-    lineage = _trajectory_lineage(trajectory, weight_version, stop_reason=None, role="ahat")
+    lineage = _trajectory_lineage(trajectory, weight_version, stop_reason=None, role="reflect")
     sample = _rendered_sample(
         slot_sample, trajectory, messages, mask_generator, reward=1.0, status=Sample.Status.COMPLETED, lineage=lineage
     )
     if sample is not None:
         sample.index, sample.group_index = index, group_index
     return sample
+
+
+def check_reasoning_is_trained(mask_generator: MultiTurnLossMaskGenerator) -> None:
+    """Refuse a chat template and loss mask under which an inserted turn's reasoning is not trained.
+
+    Sprout inserts a reviewer's turn with its text as ``reasoning_content`` and
+    an empty ``content``, and the turn's CE sample (``turn_sample``) trains
+    that turn. A template that drops ``reasoning_content`` -- Qwen3's does
+    before the last user message, so for every turn when each message is
+    rendered alone -- would train the commands without the reasoning they
+    follow from. The probe is such a turn after a user message, rendered the
+    way a sample is.
+    """
+    probe = [
+        {"role": "user", "content": "probe"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": REASONING_PROBE,
+            "tool_calls": [
+                {"id": "probe-1", "type": "function", "function": {"name": "bash", "arguments": {"command": "true"}}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "probe-1", "content": "done"},
+    ]
+    mask_type = mask_generator.tokenizer_type
+    try:
+        token_ids, loss_mask = mask_generator.get_loss_mask(probe, tools=PROBE_TOOLS)
+        trained = mask_generator.tokenizer.decode([t for t, keep in zip(token_ids, loss_mask, strict=True) if keep])
+    except Exception as error:
+        raise ValueError(
+            f"the chat template cannot render an inserted turn (--loss-mask-type {mask_type}): {error}"
+        ) from error
+    if REASONING_PROBE not in trained:
+        raise ValueError(
+            f"the chat template and --loss-mask-type {mask_type} do not train an assistant turn's reasoning_content "
+            f"(trained: {trained!r}); a reviewer turn's CE sample would learn its commands without its reasoning"
+        )
 
 
 def _trajectory_lineage(

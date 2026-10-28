@@ -6,10 +6,10 @@ search needs its ``miles.review`` section, without which every
 without which the review job is refused once the roots are graded. The script
 runs as an operator runs it (``main``, so ``prepare`` on the rows it reads),
 from a local row file and parser file, with nothing downloaded. With a Sprout
-checkout (``SPROUT_REPO``, else one beside this one: the lookup
-``test_gsml_wiring.py`` uses) the written config also goes through Sprout's
-own driver: the loader ``python -m sprout.rl_driver`` runs, then a search
-request as ``SproutRolloutFn`` builds it.
+checkout (``SPROUT_REPO``, else one beside this one: ``conftest.sprout_examples``)
+the written config also goes through Sprout's own driver: the loader
+``python -m sprout.rl_driver`` runs, then a RAFO search request as
+``SproutRolloutFn`` builds it.
 """
 
 import asyncio
@@ -22,8 +22,8 @@ from types import ModuleType, SimpleNamespace
 
 import httpx
 import pytest
-from tests.fast.rollout.sprout.test_gsml_wiring import sprout_examples
-from tests.fast.rollout.sprout.test_search_request import construct, search_args
+from tests.fast.rollout.sprout.conftest import sprout_examples
+from tests.fast.rollout.sprout.test_rafo_request import construct, rafo_args
 
 from miles.utils.types import Sample
 
@@ -78,8 +78,11 @@ def run_script(prepare_data: ModuleType, monkeypatch, tmp_path: Path, flags: dic
         "--parser-file": str(parser_file),
         **flags,
     }
-    monkeypatch.setattr(sys, "argv", ["prepare_data.py",
-                                      *(item for key, value in argv.items() for item in (key, value) if item is not None)])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prepare_data.py", *(item for key, value in argv.items() for item in (key, value) if item is not None)],
+    )
     prepare_data.main()
     return tmp_path / "out"
 
@@ -96,8 +99,11 @@ def test_the_prompt_carries_the_interface_the_tests_use(prepare_data, monkeypatc
     assert first.endswith("The fix provides this interface, which the tests use:\n\n" + interface)
     for none in ("No new interfaces are introduced.", "", None):
         assert prepare_data.prompt_for({**row("octo__widgets-1"), "interface": none}) == (
-            "Work in /widgets and fix this issue:\n\nWidget.resize drops the border.")
-    assert interface not in prepare_data.prompt_for({**row("octo__widgets-1"), "interface": interface}, interface=False)
+            "Work in /widgets and fix this issue:\n\nWidget.resize drops the border."
+        )
+    assert interface not in prepare_data.prompt_for(
+        {**row("octo__widgets-1"), "interface": interface}, interface=False
+    )
     # Through the script: on by default, recorded in the manifest, and off with --no-interface.
     plain = row
     monkeypatch.setattr(sys.modules[__name__], "row", lambda task_id: {**plain(task_id), "interface": interface})
@@ -176,7 +182,7 @@ def sprout(monkeypatch) -> SimpleNamespace:
     directory = sprout_examples()
     if directory is None:
         pytest.skip("no Sprout checkout beside this one: set SPROUT_REPO to run the config through Sprout's driver")
-    source = directory.parents[1].resolve()  # the checkout's src/
+    source = (directory.parents[1] / "src").resolve()  # the checkout's src/
     monkeypatch.syspath_prepend(str(source))
     modules = SimpleNamespace(
         messages=importlib.import_module("sprout.rl_driver.messages"),
@@ -222,7 +228,7 @@ def test_sprouts_driver_reads_the_config_and_takes_a_search_request_as_miles_bui
     group = [
         Sample(prompt=first["prompt"], index=index, group_index=0, metadata=first["metadata"]) for index in (0, 1)
     ]
-    request, _ = construct(search_args())._build_request(group=group, rollout_id=1)
+    request, _ = construct(rafo_args())._build_request(group=group, rollout_id=1)
     assert request.search is not None
     response = asyncio.run(post(app, "/rollout-groups", request.wire()))
     assert response.status_code == 202, response.text
