@@ -19,6 +19,8 @@ from transformers import PreTrainedTokenizerFast
 
 from miles.rollout.sprout.gsml import assemble_search_group, search_outcome
 from miles.rollout.sprout.protocol import RolloutResult
+from miles.utils.args.custom_function import CustomFunctionConfig
+from miles.utils.args.custom_view import ImmutableNamespace
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.types import Sample
 
@@ -292,6 +294,16 @@ def gsml_args(**updates) -> Namespace:
         "reward_key": None,
     }
     return Namespace(**{**fields, **updates})
+
+
+def trainer_view(namespace: Namespace) -> ImmutableNamespace:
+    """The arguments as the trainer's reward post-process sees them: a typed view whose post-process path is a
+    custom function (``_post_process_rewards`` builds the function's config view from it)."""
+    values = vars(namespace)
+    path = values.get("custom_reward_post_process_path")
+    return ImmutableNamespace(
+        **{**values, "custom_reward_post_process_path": None if path is None else CustomFunctionConfig(path=path)}
+    )
 
 
 def assemble(mask_generator, body: dict, slots: dict[str, Sample], *, planned_roots: int = 2):

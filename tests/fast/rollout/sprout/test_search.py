@@ -386,7 +386,8 @@ def test_the_reasoning_probe_passes_a_template_that_trains_reasoning_and_refuses
     assert dropping != TEMPLATE
     with pytest.raises(ValueError, match="do not train an assistant turn's reasoning_content"):
         check_reasoning_is_trained(toy_mask_generator(dropping))
-    with pytest.raises(ValueError, match="distill_qwen do not train"):
+    # distill_qwen cannot render a turn of tool calls as a trained target at all (#4444)
+    with pytest.raises(ValueError, match=r"cannot render an inserted turn \(--loss-mask-type distill_qwen\)"):
         check_reasoning_is_trained(toy_mask_generator(tokenizer_type="distill_qwen"))
     # Qwen3.8's template, for one, refuses an assistant turn rendered without a user message before it.
     refusing = TEMPLATE.replace(

@@ -188,9 +188,10 @@ def test_an_ahat_sample_trains_the_inserted_turn_alone_in_its_context(mask_gener
 
 def test_an_ahat_sample_needs_an_inserted_turn_and_is_none_when_nothing_trains():
     _result, trajectory, slot = repair()
-    # distill_qwen trains only the last message's content, which a canonical turn leaves empty.
+    # distill_qwen trains only a final plain-text answer; a turn of tool calls has none, so it refuses (#4444).
     distill = toy_mask_generator(tokenizer_type="distill_qwen")
-    assert ahat_sample(trajectory, slot, distill, index=100, group_index=50, weight_version=None) is None
+    with pytest.raises(ValueError, match="distill_qwen loss mask needs an assistant message without tool_calls"):
+        ahat_sample(trajectory, slot, distill, index=100, group_index=50, weight_version=None)
     student = trajectory.model_copy(
         update={"metadata": {**trajectory.metadata, "provenance": {"prefix_messages": 3, "inserted_messages": []}}}
     )

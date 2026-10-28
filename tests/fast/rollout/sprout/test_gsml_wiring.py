@@ -32,8 +32,10 @@ from tests.fast.rollout.sprout.conftest import (
     gsml_args,
     search_result,
     toy_mask_generator,
+    trainer_view,
 )
 from tests.fast.rollout.sprout.test_search_request import THINKING, Data, SearchDriver, construct, search_args
+from tests.fast.train_parallel_config_utils import make_train_parallel_config
 
 from miles.backends.training_utils.loss.hub.advantages import compute_advantages
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
@@ -258,12 +260,13 @@ def test_the_example_trains_end_to_end_each_sample_at_its_a(mask_generator):
     [sent] = driver.requests
     assert sent["max_samples"] == 14 and driver.deleted == [sent["rollout_job_id"]]
 
-    flat, metadata = postprocess_rollout_data(namespace, output.samples, train_parallel_config={"dp_size": 1})
+    config = make_train_parallel_config(dp_size=1)
+    flat, metadata = postprocess_rollout_data(namespace, output.samples, train_parallel_config=config)
     assert len(flat) == 15 and metadata["dynamic_global_batch_size"] == 15, "one optimizer step trains them all"
     # As the trainer applies it: the post-process the rollout function requires, loaded from its path.
     post_process = load_function(namespace.custom_reward_post_process_path)
     assert post_process is post_process_gsml
-    _, rewards = _post_process_rewards(namespace, flat, post_process)
+    _, rewards = _post_process_rewards(trainer_view(namespace), flat, post_process)
     assert_the_shared_example(by_condition(flat, rewards))
     loss_masks = [torch.tensor(sample.loss_mask, dtype=torch.int32) for sample in flat]
     advantages, _ = compute_advantages(

@@ -27,6 +27,7 @@ from tests.fast.rollout.sprout.conftest import (
     search_result,
     toy_mask_generator,
 )
+from tests.fast.train_parallel_config_utils import make_train_parallel_config
 
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainInput
@@ -294,8 +295,14 @@ def test_a_group_whose_every_root_failed_returns_nothing_beside_the_others(mask_
     assert output.metrics["rollout/sprout/failed_samples"] == 2
     assert output.metrics[f"{M}cases/ungraded"] == 1 and output.metrics[f"{M}cases/FF"] == 1, "summed over groups"
     # How many samples a search step returns varies: one optimizer step trains all of them.
-    batch = Namespace(disable_rollout_trim_samples=False, use_dynamic_global_batch_size=True, global_batch_size=4)
-    kept, metadata = postprocess_rollout_data(batch, output.samples, train_parallel_config={"dp_size": 1})
+    batch = Namespace(
+        disable_rollout_trim_samples=False,
+        use_dynamic_global_batch_size=True,
+        global_batch_size=4,
+        enable_sample_ownership_checker=False,
+    )
+    config = make_train_parallel_config(dp_size=1)
+    kept, metadata = postprocess_rollout_data(batch, output.samples, train_parallel_config=config)
     assert len(kept) == 15 and metadata["dynamic_global_batch_size"] == 15
     fixed = Namespace(**{**vars(batch), "use_dynamic_global_batch_size": False})
     trimmed, _ = postprocess_rollout_data(fixed, output.samples, train_parallel_config=None)

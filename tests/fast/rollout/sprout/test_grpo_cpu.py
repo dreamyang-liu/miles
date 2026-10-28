@@ -12,7 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tests.fast.rollout.sprout.conftest import assemble, ff_example, group, gsml_args, sprout_result
+from tests.fast.rollout.sprout.conftest import assemble, ff_example, group, gsml_args, sprout_result, trainer_view
+from tests.fast.train_parallel_config_utils import make_train_parallel_config
 
 from miles.backends.training_utils.data import context_parallel
 from miles.backends.training_utils.data.context_parallel import get_sum_of_sample_mean
@@ -22,6 +23,7 @@ from miles.ray.rollout.train_data_conversion import _post_process_rewards
 from miles.rollout.sprout.importer import import_trajectories
 from miles.rollout.sprout.protocol import RolloutResult
 from miles.rollout.sprout.rewards import post_process_gsml
+from miles.rollout.sprout.rollout_fn import GSML_POST_PROCESS
 
 
 def imported_group(mask_generator, *, group_index, first_index, rewards):
@@ -99,9 +101,16 @@ def test_advantages_broadcast_the_group_reward_over_response_tokens(mask_generat
 def gsml_step(mask_generator):
     """The shared FF example as the trainer gets it: one dynamic batch, advantages from GSML."""
     samples, _ = assemble(mask_generator, *ff_example())
-    namespace = Namespace(**{**vars(grpo_args(use_dynamic_global_batch_size=True)), **vars(gsml_args())})
-    flat, _ = postprocess_rollout_data(namespace, [samples], train_parallel_config={"dp_size": 1})
-    _, advantages = _post_process_rewards(namespace, flat, post_process_gsml)
+    namespace = Namespace(
+        **{
+            **vars(grpo_args(use_dynamic_global_batch_size=True)),
+            **vars(gsml_args()),
+            "custom_reward_post_process_path": GSML_POST_PROCESS,
+        }
+    )
+    config = make_train_parallel_config(dp_size=1)
+    flat, _ = postprocess_rollout_data(namespace, [samples], train_parallel_config=config)
+    _, advantages = _post_process_rewards(trainer_view(namespace), flat, post_process_gsml)
     return flat, advantages
 
 
