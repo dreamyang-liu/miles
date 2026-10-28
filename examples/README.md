@@ -46,6 +46,7 @@ Not fully verified — for experimental and development use.
 - **[multi_agent](./experimental/multi_agent)**: Example of running multi-agent RL with `miles`.
 - **[nemo-gym](./experimental/nemo-gym)**: SWE-agent training with NVIDIA NeMo Gym as the environment ecosystem.
 - **[openenv](./experimental/openenv)**: Rollouts against OpenEnv-hosted environments.
+- **[rafo](./experimental/rafo)**: Reviewer-guided forest RL: a reviewer writes a first-person turn that exposes the bug with a check, and the agent continues.
 - **[reproducibility](./experimental/reproducibility)**: Guides on achieving bitwise experiment reproduction using deterministic modes.
 - **[search-r1](./experimental/search-r1)**: A minimal reproduction of Search-R1, featuring multi-turn conversation and tool-calling.
 - **[strands_sglang](./experimental/strands_sglang)**: Integration example with the Strands-Agents scaffolding framework.
