@@ -8,7 +8,8 @@ the policy endpoint. It grades each final snapshot with the official
 SWE-rebench procedure in a fresh sandbox, and returns every trajectory as Chat
 Completions messages with a 0/1 reward. Trained as they come back, those
 rollouts are standard GRPO; the launcher below runs a hindsight search instead,
-credited by GSML (see [Hindsight search](#hindsight-search)).
+credited by GSML (see [Hindsight search](#hindsight-search)) or by RAFO (see
+[RAFO credit](#rafo-credit)).
 
 ```text
 Miles SproutRolloutFn ── POST /rollout-groups ──> Sprout RL driver (:11001)
@@ -369,6 +370,86 @@ Each step sums, over its tasks, under `rollout/sprout/gsml/`:
 `rollout/sprout/ungradable` and `rollout/sprout/failed_samples` count the
 missing trajectories, and `rollout/sprout/reward_mean` is taken over the
 gradable ones.
+
+## RAFO credit
+
+With `--credit rafo` (`--sprout-rollout-credit rafo`), the same search trains
+with RAFO (`miles/rollout/sprout/rafo.py`) instead of GSML. Sprout still runs
+the roots, the review, the branches and the repair rounds. What changes is what
+each sample trains:
+
+| Sample | Loss | Advantage | Coefficient |
+|---|---|---|---|
+| root | PPO with dual clip | local RLOO among the task's gradable roots | 1/(M·C) |
+| student or repair | PPO with dual clip | local RLOO within its condition (`Trajectory.group`) | 1/(G·K·C) |
+| reviewer turn | CE on the turn alone (its reasoning, its calls, its end of turn), after its history | none | w/(T·C_h) |
+
+The denominators are constants of the search, so no coefficient depends on what
+was sampled:
+
+- M is the number of roots.
+- G is the most continuation groups that one task can make:
+  roots·points·(1 + candidates·rounds), or the bound for the `TF` shape.
+- K is the planned size of the group.
+- T is the most reviewer turns: roots·points·candidates·rounds.
+- C and C_h are `--sprout-rollout-rafo-c` and `--sprout-rollout-rafo-c-h`.
+
+A turn's weight w is computed in two steps:
+
+1. Take the mean, over the turn's gradable continuations, of max(R′, w_child).
+   w_child is the weight of a later round's turn inserted in that continuation
+   (`--sprout-rollout-rafo-turn-credit subtree`). With `own`, only R′ counts.
+2. For a first-round turn, subtract the mean R of the students at its point
+   (`--sprout-rollout-rafo-baseline students`; `none` subtracts nothing). The
+   result is at least 0.
+
+R′, the leak gate and the canonical rendering are GSML's (above). A turn that
+fails the gate or the rendering gets w = 0.
+
+These samples train nothing:
+
+- a group whose members all have the same result, or that has only one member;
+- a turn with w = 0.
+
+A task with no signal keeps one zero-weight root, so that it still counts in
+its step.
+
+All samples of a task share its rollout id. Miles trains them in one step and
+divides the step's loss by its number of tasks. So `--global-batch-size` counts
+tasks: the launcher uses half the rollout batch, which gives two steps.
+`--allow-partial-train-step` keeps a short last step when a group failed.
+
+Construction refuses a RAFO search without each of these:
+
+- `--loss-type custom_loss --custom-loss-function-path miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function`;
+- `--train-backend megatron`, which passes `train_metadata` to the loss and
+  keeps a task's samples in one step;
+- `--disable-rewards-normalization`;
+- `--n-samples-per-prompt` 2 or more.
+
+It also refuses `--custom-reward-post-process-path` and
+`--use-dynamic-global-batch-size`. The loss refuses these:
+
+- `--calculate-per-token-loss`;
+- KL and entropy terms;
+- TIS and OPSM;
+- rollout log-probs as π_old.
+
+Some graders do not give the hidden-test facts, for example Sprout's `harbor`
+grader. Then every turn's leak list is `null` and every repair's
+`touched_test_paths` is missing. Under the gates above, no reviewer turn trains
+and every repair's R′ is 0, under GSML and RAFO alike.
+
+Each step sums these values over its tasks, under `rollout/sprout/rafo/`:
+
+- `cases/<outcome>`;
+- `turns`, with `turns_trained`, `turns_leaked`, `turns_unverified`,
+  `turns_noncanonical`, `turns_without_gain` and `chain_turns`;
+- `ppo_samples`, `placeholders`, `estimation_only` and `ungradable`;
+- `continuations_touching_tests`.
+
+The loss logs `rafo_*` sums for each task: the PPO and CE losses, the PPO and
+CE tokens, the clipped tokens and the k3 KL.
 
 ## Without a GPU
 

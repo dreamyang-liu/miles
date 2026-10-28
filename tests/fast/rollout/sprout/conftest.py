@@ -123,6 +123,11 @@ def args(**updates) -> Namespace:
         "skip_actor_forward_only": False,
         "use_tis": False,
         "compute_advantages_and_returns": True,
+        "sprout_rollout_credit": "gsml",
+        "sprout_rollout_rafo_c": 64.0,
+        "sprout_rollout_rafo_c_h": 32.0,
+        "sprout_rollout_rafo_turn_credit": "subtree",
+        "sprout_rollout_rafo_baseline": "students",
     }
     return Namespace(**{**fields, **updates})
 

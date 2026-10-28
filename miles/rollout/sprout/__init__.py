@@ -10,5 +10,7 @@ turns and trains with its ordinary GRPO path. See ``rollout_fn.SproutRolloutFn``
 With a hindsight search (``protocol.SearchSpec``) Sprout also branches from the
 points its review chose in the failed roots, and the group is credited by GSML
 instead: ``gsml.assemble_search_group`` gives each sample its credit and
-``rewards.post_process_gsml`` turns it into the advantage.
+``rewards.post_process_gsml`` turns it into the advantage. Under
+``--sprout-rollout-credit rafo``, ``rafo.assemble_rafo_group`` gives each sample
+its RAFO role instead, which the RAFO loss trains.
 """

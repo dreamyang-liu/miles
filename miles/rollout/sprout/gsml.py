@@ -203,9 +203,9 @@ def assemble_search_group(
     if result.status == "failed" and not result.trajectories:
         counts[f"cases/{search_outcome(planned_roots, 0, 0)}"] = 1  # every root's actor failed
         return [], _metric_names(counts)
-    _check_group(result, slot_samples)
-    members = [_member(trajectory) for trajectory in result.trajectories]
-    case = _outcome(members, planned_roots)
+    check_group(result, slot_samples)
+    members = [search_member(trajectory) for trajectory in result.trajectories]
+    case = checked_outcome(members, planned_roots)
     z = _z_scores(members)
     points = _points(members) if case == "FF" else {}
     credits = {member.slot: _credit(member, z[member.slot], case, points) for member in members if member.gradable}
@@ -228,7 +228,7 @@ class _Assembly:
 
 
 @dataclass(frozen=True)
-class _Member:
+class SearchMember:
     """A returned trajectory as the credit rules read it."""
 
     trajectory: Trajectory
@@ -250,10 +250,10 @@ class _Member:
 
 
 @dataclass(frozen=True)
-class _Candidate:
+class SearchCandidate:
     """A reviewer's turn at one point, by its gradable continuations."""
 
-    continuations: tuple[_Member, ...]
+    continuations: tuple[SearchMember, ...]
     k_m: int
     #: leak_terms names terms the review could see but the history did not show.
     leaked: bool
@@ -274,7 +274,7 @@ class _Point:
     #: |S_s|, the gradable students, and c_s, how many of them resolved.
     students: int
     c_s: int
-    candidates: dict[int, _Candidate]
+    candidates: dict[int, SearchCandidate]
     omega: float = 0.0
 
     @property
@@ -297,7 +297,7 @@ class _Point:
         return self.exact or self.guided
 
 
-def _check_group(result: RolloutResult, slot_samples: Mapping[str, Sample]) -> None:
+def check_group(result: RolloutResult, slot_samples: Mapping[str, Sample]) -> None:
     if result.status not in {"completed", "early_stopped"}:
         raise ValueError(f"cannot credit a rollout group with status={result.status!r}: {result.stop_reason}")
     if result.max_samples > len(slot_samples):
@@ -307,7 +307,7 @@ def _check_group(result: RolloutResult, slot_samples: Mapping[str, Sample]) -> N
             raise ValueError(f"unknown sample_slot_id: {trajectory.sample_slot_id!r}")
 
 
-def _member(trajectory: Trajectory) -> _Member:
+def search_member(trajectory: Trajectory) -> SearchMember:
     """Read what the credit needs from Sprout's annotations, refusing a trajectory that lacks them."""
     slot, metadata = trajectory.sample_slot_id, trajectory.metadata
     search = metadata.get("search")
@@ -329,7 +329,7 @@ def _member(trajectory: Trajectory) -> _Member:
     # task's test patch resolved nothing it can be credited for; neither did
     # one whose grade could not say which files it touched.
     touching = kind == "repair" and gradable and (not isinstance(touched, list) or bool(touched))
-    return _Member(
+    return SearchMember(
         trajectory=trajectory,
         kind=kind,
         point_id=None if kind == "root" else point_id,
@@ -357,7 +357,7 @@ def _canonical(trajectory: Trajectory) -> bool:
     return True
 
 
-def _outcome(members: list[_Member], planned_roots: int) -> str:
+def checked_outcome(members: list[SearchMember], planned_roots: int) -> str:
     """Miles's own label for the task, which every trajectory's annotation must repeat."""
     roots = [member for member in members if member.kind == "root"]
     if len(roots) > planned_roots:
@@ -375,9 +375,9 @@ def _outcome(members: list[_Member], planned_roots: int) -> str:
     return case
 
 
-def _z_scores(members: list[_Member]) -> dict[str, float]:
+def _z_scores(members: list[SearchMember]) -> dict[str, float]:
     """Each gradable trajectory's z-score within its group, estimation-only ones included."""
-    groups: dict[str, list[_Member]] = {}
+    groups: dict[str, list[SearchMember]] = {}
     for member in members:
         if member.gradable:
             groups.setdefault(member.trajectory.group, []).append(member)
@@ -388,11 +388,11 @@ def _z_scores(members: list[_Member]) -> dict[str, float]:
     }
 
 
-def _points(members: list[_Member]) -> dict[str, _Point]:
+def _points(members: list[SearchMember]) -> dict[str, _Point]:
     """An FF task's points: who resolved there, each candidate's K_m and gates, and ω_s,
     one share of the λ mass per point that can be credited."""
-    students: dict[str, list[_Member]] = {}
-    repairs: dict[str, dict[int, list[_Member]]] = {}
+    students: dict[str, list[SearchMember]] = {}
+    repairs: dict[str, dict[int, list[SearchMember]]] = {}
     for member in members:
         if member.kind == "student":
             students.setdefault(member.point_id, []).append(member)
@@ -401,7 +401,7 @@ def _points(members: list[_Member]) -> dict[str, _Point]:
     points = {}
     for point_id in dict.fromkeys([*students, *repairs]):
         graded = [member for member in students.get(point_id, []) if member.gradable]
-        candidates = {number: _candidate(group) for number, group in repairs.get(point_id, {}).items()}
+        candidates = {number: search_candidate(group) for number, group in repairs.get(point_id, {}).items()}
         points[point_id] = _Point(point_id, len(graded), int(sum(m.value for m in graded)), candidates)
     creditable = sum(point.creditable for point in points.values())
     return {
@@ -410,9 +410,9 @@ def _points(members: list[_Member]) -> dict[str, _Point]:
     }
 
 
-def _candidate(members: list[_Member]) -> _Candidate:
+def search_candidate(members: list[SearchMember]) -> SearchCandidate:
     graded = tuple(member for member in members if member.gradable)
-    return _Candidate(
+    return SearchCandidate(
         continuations=graded,
         k_m=int(sum(member.value for member in graded)),
         leaked=any(isinstance(m.leak_terms, list) and bool(m.leak_terms) for m in graded),
@@ -421,7 +421,7 @@ def _candidate(members: list[_Member]) -> _Candidate:
     )
 
 
-def _credit(member: _Member, z: float, case: str, points: dict[str, _Point]) -> Credit:
+def _credit(member: SearchMember, z: float, case: str, points: dict[str, _Point]) -> Credit:
     """One gradable trajectory's credit; ``points`` is empty unless the task is FF."""
     if member.kind == "root":
         return Credit(kind="root", beta="root", z=z, lambda_share=0.0, case=case)
@@ -453,7 +453,7 @@ def _credit(member: _Member, z: float, case: str, points: dict[str, _Point]) -> 
 
 
 def _trajectory_samples(
-    assembly: _Assembly, members: list[_Member], credits: dict[str, Credit], group_indices: Iterator[int]
+    assembly: _Assembly, members: list[SearchMember], credits: dict[str, Credit], group_indices: Iterator[int]
 ) -> list[Sample]:
     """The gradable trajectories with something to train, each branch in its condition's group."""
     samples, groups = [], {}
@@ -504,7 +504,7 @@ def _ahat_turn(
     assembly: _Assembly,
     point: _Point,
     number: int,
-    candidate: _Candidate,
+    candidate: SearchCandidate,
     source: Trajectory,
     turn: int,
     n_turns: int,
@@ -552,7 +552,7 @@ def _annotate(sample: Sample, credit: Credit, result: RolloutResult) -> None:
         )
 
 
-def _measure(counts: dict[str, int], case: str, members: list[_Member], points: dict[str, _Point]) -> None:
+def _measure(counts: dict[str, int], case: str, members: list[SearchMember], points: dict[str, _Point]) -> None:
     """The task's label, its points by how they were credited and its candidates by the gates they failed
     (a candidate may fail several; ``candidates_eligible`` passed all, whether or not a student resolved)."""
     counts[f"cases/{case}"] = 1

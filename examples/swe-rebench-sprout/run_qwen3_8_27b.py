@@ -43,6 +43,13 @@ of time is missing. How many samples a step returns varies, so the step is one
 optimizer step over all of them (``--use-dynamic-global-batch-size``), and the
 loss is a sum over their trainable tokens (``--calculate-per-token-loss``).
 
+``--credit rafo`` trains the same search with RAFO instead (``miles.rollout.sprout.rafo``): each root, student
+and repair with PPO on its local RLOO advantage within its condition, and each reviewer turn with CE on the turn
+alone, weighted by how its continuations did (a later round that rescued one counts with that round's weight) over
+the students at its point. Every coefficient is a constant of the search (``--sprout-rollout-rafo-c`` and
+``-c-h`` normalize the tokens), all samples of a task are one rollout, and ``--global-batch-size`` counts the
+tasks of an optimizer step: two steps for each rollout batch.
+
 ``--load-rollout-data`` trains on a saved rollout without SGLang or Sprout. One
 saved by ``rollout_only.py`` lacks the ``dynamic_global_batch_size`` metadata
 that ``--use-dynamic-global-batch-size`` requires of it (README, "Without a GPU").
@@ -54,6 +61,7 @@ Example:
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 import typer
 
@@ -112,6 +120,13 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     gsml_c_pre: float = 0.0
     gsml_kappa_plus: float = 0.0
 
+    # How the search trains: GSML, or RAFO with its fixed token normalizers C and C_h.
+    credit: Literal["gsml", "rafo"] = "gsml"
+    rafo_c: float = 64.0
+    rafo_c_h: float = 32.0
+    rafo_turn_credit: Literal["subtree", "own"] = "subtree"
+    rafo_baseline: Literal["students", "none"] = "students"
+
     # GRPO
     num_rollout: int = 100
     rollout_batch_size: int = 16
@@ -131,8 +146,10 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
             raise ValueError("This single-node recipe colocates a TP x CP trainer that covers the node")
         if self.max_tokens_per_gpu * self.cp < self.max_context_len:
             raise ValueError("max_tokens_per_gpu * cp must hold one max_context_len trajectory")
-        if self.n_samples_per_prompt != 2:
+        if self.credit == "gsml" and self.n_samples_per_prompt != 2:
             raise ValueError("GSML credits a task's two roots: n_samples_per_prompt must be 2")
+        if self.credit == "rafo" and self.n_samples_per_prompt < 2:
+            raise ValueError("RAFO's roots are one local RLOO group: n_samples_per_prompt must be at least 2")
         if not self.load_rollout_data and not self.model_endpoint:
             raise ValueError("--model-endpoint is how Sprout's sandboxes reach the policy: this host's router")
 
@@ -166,9 +183,6 @@ def train_args(args: ScriptArgs) -> str:
         f"--sprout-rollout-finalization-timeout-seconds {args.finalization_timeout} "
         f"--num-rollout {args.num_rollout} --rollout-batch-size {args.rollout_batch_size} "
         f"--n-samples-per-prompt {args.n_samples_per_prompt} "
-        # Nominal: the step trains every sample it got, roots and branches alike.
-        f"--global-batch-size {args.rollout_batch_size * args.n_samples_per_prompt} "
-        "--use-dynamic-global-batch-size "
         f"--sprout-rollout-search-points {args.search_points} "
         f"--sprout-rollout-search-candidates {args.search_candidates} "
         f"--sprout-rollout-search-student-continuations {args.search_student_continuations} "
@@ -177,13 +191,6 @@ def train_args(args: ScriptArgs) -> str:
         f"--sprout-rollout-search-repair-rounds {args.search_repair_rounds} "
         f"--sprout-rollout-search-review-seconds {args.review_seconds} "
         f"--sprout-rollout-search-wall-time-seconds {args.branch_seconds} "
-        # Each sample's GSML credit, under these coefficients, becomes its advantage.
-        "--custom-reward-post-process-path miles.rollout.sprout.rewards.post_process_gsml "
-        f"--sprout-rollout-gsml-lambda {args.gsml_lambda} "
-        f"--sprout-rollout-gsml-beta-branch {args.gsml_beta_branch} "
-        f"--sprout-rollout-gsml-psi {args.gsml_psi} "
-        f"--sprout-rollout-gsml-c-pre {args.gsml_c_pre} "
-        f"--sprout-rollout-gsml-kappa-plus {args.gsml_kappa_plus} "
         f"--rollout-temperature {args.temperature} "
         # The full softmax the trainer scores: Miles always sends top_k (-1 here)
         # and Sprout forwards it, so the engine does not fall back to the
@@ -201,27 +208,7 @@ def train_args(args: ScriptArgs) -> str:
         rollout_args += f"--sprout-rollout-model-endpoint {args.model_endpoint} "
     if args.load_rollout_data:
         rollout_args += f"--load-debug-rollout-data {args.load_rollout_data} "
-    # Each sample's advantage is its GSML A as post_process_gsml returns it:
-    # --advantage-estimator grpo broadcasts it over the sample's trainable
-    # tokens, and nothing normalizes it again (a search refuses
-    # --normalize-advantages). Log-probs are recomputed by the trainer on the
-    # retokenized sequence (no --use-rollout-logprobs, no TIS). No KL loss: at
-    # coefficient 0 it would only add the reference model's forward pass.
-    #
-    # --calculate-per-token-loss: the loss is a sum over the step's trainable
-    # tokens, each weighted by its sample's A, so a token weighs the same
-    # whatever its sample's length; the sum is divided by the step's token
-    # count. That count varies from step to step (samples whose A is 0 add to it
-    # as well), so the update is consistent, not exact; an exact one needs a
-    # constant divisor, the CP-aware reducer that is deferred. In raw mode (the
-    # default --megatron-to-hf-mode) with CP=4, Miles counts each sample's tokens
-    # on every CP rank and scales the loss by cp, and Megatron reduces
-    # num_tokens over dp x cp, so the two cancel.
-    grpo_args = (
-        "--advantage-estimator grpo "
-        "--calculate-per-token-loss "
-        "--entropy-coef 0.0 --eps-clip 0.2 --eps-clip-high 0.28 "
-    )
+    credit_args = _rafo_args(args) if args.credit == "rafo" else _gsml_args(args)
     optimizer_args = (
         f"--optimizer adam --lr {args.lr} --lr-decay-style constant "
         "--weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98 "
@@ -255,12 +242,65 @@ def train_args(args: ScriptArgs) -> str:
     return (
         checkpoint_args
         + rollout_args
-        + grpo_args
+        + credit_args
         + optimizer_args
         + perf_args
         + sglang_args
         + misc_args
         + args.extra_args
+    )
+
+
+def _gsml_args(args: ScriptArgs) -> str:
+    # Each sample's advantage is its GSML A as post_process_gsml returns it:
+    # --advantage-estimator grpo broadcasts it over the sample's trainable
+    # tokens, and nothing normalizes it again (a search refuses
+    # --normalize-advantages). Log-probs are recomputed by the trainer on the
+    # retokenized sequence (no --use-rollout-logprobs, no TIS). No KL loss: at
+    # coefficient 0 it would only add the reference model's forward pass.
+    #
+    # --calculate-per-token-loss: the loss is a sum over the step's trainable
+    # tokens, each weighted by its sample's A, so a token weighs the same
+    # whatever its sample's length; the sum is divided by the step's token
+    # count. That count varies from step to step (samples whose A is 0 add to it
+    # as well), so the update is consistent, not exact; an exact one needs a
+    # constant divisor, the CP-aware reducer that is deferred. In raw mode (the
+    # default --megatron-to-hf-mode) with CP=4, Miles counts each sample's tokens
+    # on every CP rank and scales the loss by cp, and Megatron reduces
+    # num_tokens over dp x cp, so the two cancel.
+    return (
+        # Nominal: the step trains every sample it got, roots and branches alike.
+        f"--global-batch-size {args.rollout_batch_size * args.n_samples_per_prompt} "
+        "--use-dynamic-global-batch-size "
+        # Each sample's GSML credit, under these coefficients, becomes its advantage.
+        "--custom-reward-post-process-path miles.rollout.sprout.rewards.post_process_gsml "
+        f"--sprout-rollout-gsml-lambda {args.gsml_lambda} "
+        f"--sprout-rollout-gsml-beta-branch {args.gsml_beta_branch} "
+        f"--sprout-rollout-gsml-psi {args.gsml_psi} "
+        f"--sprout-rollout-gsml-c-pre {args.gsml_c_pre} "
+        f"--sprout-rollout-gsml-kappa-plus {args.gsml_kappa_plus} "
+        "--advantage-estimator grpo "
+        "--calculate-per-token-loss "
+        "--entropy-coef 0.0 --eps-clip 0.2 --eps-clip-high 0.28 "
+    )
+
+
+def _rafo_args(args: ScriptArgs) -> str:
+    return (
+        # One rollout is one task: two optimizer steps for each rollout batch, each divided by its tasks.
+        # A group that failed leaves its step short instead of dropping the tasks after it.
+        f"--global-batch-size {args.rollout_batch_size // 2} "
+        "--allow-partial-train-step "
+        "--sprout-rollout-credit rafo "
+        f"--sprout-rollout-rafo-c {args.rafo_c} "
+        f"--sprout-rollout-rafo-c-h {args.rafo_c_h} "
+        f"--sprout-rollout-rafo-turn-credit {args.rafo_turn_credit} "
+        f"--sprout-rollout-rafo-baseline {args.rafo_baseline} "
+        "--loss-type custom_loss "
+        "--custom-loss-function-path miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function "
+        # The RAFO loss reads its advantages from the samples; this pass still computes pi_old.
+        "--advantage-estimator grpo --disable-rewards-normalization "
+        "--entropy-coef 0.0 --eps-clip 0.2 --eps-clip-high 0.2 --eps-clip-c 3.0 "
     )
 
 

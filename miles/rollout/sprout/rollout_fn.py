@@ -20,8 +20,12 @@ and given its advantage by ``rewards.post_process_gsml``. That advantage is
 final and each trainable token weighs alike, so construction refuses a search
 without ``--n-samples-per-prompt 2``, that post-process,
 ``--advantage-estimator grpo``, ``--calculate-per-token-loss`` and a dynamic
-global batch, or with ``--normalize-advantages``. The first step probes the
-chat template before it submits anything (``gsml.check_reasoning_is_trained``).
+global batch, or with ``--normalize-advantages``. With ``--sprout-rollout-credit
+rafo`` the search trains with RAFO instead (``rafo.assemble_rafo_group`` and the
+RAFO loss), which needs the opposite: a fixed global batch that counts tasks,
+no per-token loss, and no reward normalization (``_validate_rafo``). The first
+step probes the chat template before it submits anything
+(``gsml.check_reasoning_is_trained``).
 
 A group that fails -- rejected, failed at Sprout, or returned in a shape Miles
 cannot train -- is logged and left out of the step, counted in
@@ -57,10 +61,11 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
-from miles.rollout.sprout import gsml, rewards
+from miles.rollout.sprout import gsml, rafo, rewards
 from miles.rollout.sprout.client import SproutRolloutClient
 from miles.rollout.sprout.importer import import_trajectories
 from miles.rollout.sprout.protocol import Budget, RolloutRequest, RolloutResult, SampleSlot, SearchSpec
+from miles.utils.args.custom_function import CustomFunctionConfig
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.types import Sample
@@ -83,6 +88,10 @@ _DERIVED_REPLAY = {
 }
 #: The ``--custom-reward-post-process-path`` a search needs: it applies GSML's credit as the advantage.
 GSML_POST_PROCESS = "miles.rollout.sprout.rewards.post_process_gsml"
+#: The ``--custom-loss-function-path`` of a RAFO search: PPO and CE on the roles ``rafo.assemble_rafo_group`` gives.
+RAFO_LOSS = "miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function"
+#: ``--sprout-rollout-credit``: how a search group trains.
+CREDITS = ("gsml", "rafo")
 
 
 @dataclass(frozen=True)
@@ -111,6 +120,7 @@ class SproutRolloutFn(BaseRolloutFn):
         self._sampling_params = sampling_params(self._args)
         # A search's roots are the prompt group: n_samples_per_prompt of them (checked per group).
         self._search = self.search_spec(self._args.n_samples_per_prompt)
+        self._rafo = rafo_settings(self._args) if self._args.sprout_rollout_credit == "rafo" else None
 
     @staticmethod
     def add_arguments(parser):
@@ -270,6 +280,49 @@ class SproutRolloutFn(BaseRolloutFn):
             default=0.0,
             help="Guided credit for a task one of whose roots resolved: not implemented, 0.",
         )
+        group.add_argument(
+            "--sprout-rollout-credit",
+            type=str,
+            choices=CREDITS,
+            default="gsml",
+            help=(
+                "How a search group trains. gsml: GSML's advantages through the policy loss "
+                f"({GSML_POST_PROCESS}). rafo: RAFO, PPO with local RLOO on the trajectories and CE on the "
+                f"reviewer turns, through --loss-type custom_loss --custom-loss-function-path {RAFO_LOSS}."
+            ),
+        )
+        group.add_argument(
+            "--sprout-rollout-rafo-c",
+            type=float,
+            default=64.0,
+            help="RAFO's token normalizer C of a trajectory's PPO tokens.",
+        )
+        group.add_argument(
+            "--sprout-rollout-rafo-c-h",
+            type=float,
+            default=32.0,
+            help="RAFO's token normalizer C_h of a reviewer turn's CE tokens.",
+        )
+        group.add_argument(
+            "--sprout-rollout-rafo-turn-credit",
+            type=str,
+            choices=rafo.TURN_CREDITS,
+            default="subtree",
+            help=(
+                "A reviewer turn's weight: a continuation that a later repair round rescued counts with that "
+                "round's weight (subtree), or only the turn's own continuations count (own)."
+            ),
+        )
+        group.add_argument(
+            "--sprout-rollout-rafo-baseline",
+            type=str,
+            choices=rafo.BASELINES,
+            default="students",
+            help=(
+                "What a first-round reviewer turn's continuations are compared with: the students at its point "
+                "(students), or nothing (none)."
+            ),
+        )
         return parser
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
@@ -404,6 +457,17 @@ class SproutRolloutFn(BaseRolloutFn):
             if request.search is None:
                 samples = import_trajectories(result, slots, mask_generator, weight_version=weight_version)
                 return _GroupRollout(samples=samples, result=result, measured={})
+            if self._rafo is not None:
+                samples, measured = rafo.assemble_rafo_group(
+                    result,
+                    slots,
+                    mask_generator,
+                    spec=request.search,
+                    settings=self._rafo,
+                    weight_version=weight_version,
+                    indices=indices,
+                )
+                return _GroupRollout(samples=samples, result=result, measured=measured)
             samples, measured = gsml.assemble_search_group(
                 result,
                 slots,
@@ -541,6 +605,8 @@ def validate_configuration(args: Any) -> None:
         raise ValueError("--sprout-rollout-search-points must be a nonnegative integer")
     if points:
         _validate_search(args)
+    elif args.sprout_rollout_credit == "rafo":
+        raise ValueError("--sprout-rollout-credit rafo trains search groups: set --sprout-rollout-search-points")
     elif getattr(args, "custom_reward_post_process_path", None) == GSML_POST_PROCESS:
         raise ValueError(
             f"--custom-reward-post-process-path {GSML_POST_PROCESS} credits search groups only: set "
@@ -549,7 +615,7 @@ def validate_configuration(args: Any) -> None:
 
 
 def _validate_search(args: Any) -> None:
-    """A search's shape, and what GSML's credit needs of the trainer (``rewards.post_process_gsml``)."""
+    """A search's shape, and what its credit (``--sprout-rollout-credit``) needs of the trainer."""
     for name in (
         "sprout_rollout_search_candidates",
         "sprout_rollout_search_student_continuations",
@@ -581,6 +647,14 @@ def _validate_search(args: Any) -> None:
         value = getattr(args, name, None)
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
+    if args.sprout_rollout_credit == "rafo":
+        _validate_rafo(args)
+    else:
+        _validate_gsml(args)
+
+
+def _validate_gsml(args: Any) -> None:
+    """What GSML's credit needs of the trainer (``rewards.post_process_gsml``)."""
     if args.n_samples_per_prompt != 2:
         raise ValueError(
             "a search needs --n-samples-per-prompt 2: GSML's credit is defined for a task's two roots, "
@@ -612,6 +686,44 @@ def _validate_search(args: Any) -> None:
         )
     # λ, β_br and ψ in range, c_pre and κ+ 0: what post_process_gsml checks again when it applies them.
     rewards.coefficients(args)
+
+
+def _validate_rafo(args: Any) -> None:
+    """What RAFO's credit needs of the trainer (``rafo.assemble_rafo_group`` and the RAFO loss)."""
+    loss = args.custom_loss_function_path
+    loss_path = loss.path if isinstance(loss, CustomFunctionConfig) else loss
+    required = {
+        "--n-samples-per-prompt of at least 2: a task's roots are one local RLOO group": (
+            args.n_samples_per_prompt >= 2
+        ),
+        f"--loss-type custom_loss --custom-loss-function-path {RAFO_LOSS}": (
+            args.loss_type == "custom_loss" and loss_path == RAFO_LOSS
+        ),
+        "--train-backend megatron: it trains a task's samples in one step and passes their roles to the loss": (
+            args.train_backend == "megatron"
+        ),
+        "--disable-rewards-normalization: the samples of one task share a rollout id and differ in reward": (
+            not args.rewards_normalization
+        ),
+        "no --custom-reward-post-process-path: the RAFO loss reads its advantages from the samples": (
+            args.custom_reward_post_process_path is None
+        ),
+        "no --use-dynamic-global-batch-size: --global-batch-size counts the tasks of an optimizer step": (
+            not args.use_dynamic_global_batch_size
+        ),
+    }
+    if missing := [condition for condition, met in required.items() if not met]:
+        raise ValueError(f"--sprout-rollout-credit rafo needs {'; '.join(missing)}")
+    rafo_settings(args)
+
+
+def rafo_settings(args: Any) -> rafo.RafoSettings:
+    return rafo.RafoSettings(
+        c=args.sprout_rollout_rafo_c,
+        c_h=args.sprout_rollout_rafo_c_h,
+        turn_credit=args.sprout_rollout_rafo_turn_credit,
+        baseline=args.sprout_rollout_rafo_baseline,
+    )
 
 
 def sampling_params(args: Any) -> dict[str, Any]:
