@@ -28,7 +28,7 @@ def test_recipe_wires_the_rafo_generate_function_loss_and_log_hook(args, monkeyp
     assert _value(argv, "--loss-type") == "custom_loss"
     assert _value(argv, "--custom-loss-function-path") == "examples.experimental.rafo.loss.rafo_loss_function"
     assert _value(argv, "--custom-rollout-log-function-path") == "examples.experimental.rafo.metrics.log_rollout_data"
-    assert _value(argv, "--rafo-reviewer-path") == "examples.experimental.rafo.toy_env.toy_reviewer"
+    assert not any(flag.startswith("--rafo-reviewer") for flag in argv)  # the rollout service reviews
     assert _value(argv, "--eps-clip-c") == "3"
     assert "--disable-rewards-normalization" in argv and "--apply-chat-template" not in argv
 

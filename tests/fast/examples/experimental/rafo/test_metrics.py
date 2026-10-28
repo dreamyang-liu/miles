@@ -23,7 +23,7 @@ from miles.utils.args.custom_view import ImmutableNamespace
 async def _task_samples(index: int, policy, targets: dict) -> list:
     task = make_task_sample(replace(TASK))
     task.index = task.group_index = index
-    ctx = make_context(ScriptedActor(policy=policy), ScriptedReviewer(targets=targets), EnvLog())
+    ctx = make_context(ScriptedActor(policy=policy), EnvLog(reviewer=ScriptedReviewer(targets=targets)))
     forest = await build_forest(task, prompt_ids(task), ctx)
     return forest_samples(task, forest, COEF, credit="subtree")
 

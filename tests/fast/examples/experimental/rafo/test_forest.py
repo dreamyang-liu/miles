@@ -4,7 +4,7 @@ import pytest
 from examples.experimental.rafo.episode import make_tool_call_parser, render_reviewer_turn, template_renders_reasoning
 from examples.experimental.rafo.forest import build_forest
 from examples.experimental.rafo.protocols import ReviewerTurn, ToolCall
-from examples.experimental.rafo.toy_env import TOOL_SPECS
+from examples.experimental.rafo.toy_env import TOOL_SPECS, ToyEnv
 from tests.fast.examples.experimental.rafo.forest_fixtures import (
     TASK,
     TOKENIZER,
@@ -24,10 +24,10 @@ def _always(name: str, path: str):
     return lambda text: tool_call_text(name, path)
 
 
-async def _forest(actor, reviewer, envs=None, **config):
-    envs = envs or EnvLog()
+async def _forest(actor, reviewer, **config):
+    envs = EnvLog(reviewer=reviewer)
     task = make_task_sample()
-    return await build_forest(task, prompt_ids(task), make_context(actor, reviewer, envs, **config)), envs
+    return await build_forest(task, prompt_ids(task), make_context(actor, envs, **config)), envs
 
 
 def _own_text(sample) -> str:
@@ -100,6 +100,20 @@ class TestEvents:
         for cont in event.conts:
             assert cont.env.patches == 2  # the reviewer's check did not patch; the continuation patched once
             assert "found a suspicious line" in cont.messages[len(event.checkpoint.messages) + 1]["content"]
+
+    async def test_the_rollout_service_reviews_on_the_checkpoint_snapshot(self, monkeypatch) -> None:
+        reviewed_on = []
+        review = ToyEnv.review
+
+        async def recording_review(env, request):
+            reviewed_on.append(env)
+            return await review(env, request)
+
+        monkeypatch.setattr(ToyEnv, "review", recording_review)
+        forest, _ = await _forest(ScriptedActor(policy=follow_suspicious), ScriptedReviewer(targets={1: TASK.bug}))
+
+        assert reviewed_on == [root.checkpoint.env for root in forest.roots]
+        assert all(env.patches == 1 for env in reviewed_on)  # the state right after the first failed patch
 
     async def test_the_ce_sample_trains_only_the_reviewer_turn(self) -> None:
         forest, _ = await _forest(ScriptedActor(policy=follow_suspicious), ScriptedReviewer(targets={1: TASK.bug}))
@@ -176,11 +190,13 @@ class TestResources:
         assert envs.all_envs() and all(env.closed for env in envs.all_envs())
 
     async def test_environments_are_closed_when_the_forest_fails(self) -> None:
-        async def broken_reviewer(request):
+        async def broken_reviewer(task, request):
             raise RuntimeError("reviewer endpoint down")
 
-        envs = EnvLog()
+        envs = EnvLog(reviewer=broken_reviewer)
+        task = make_task_sample()
+        ctx = make_context(ScriptedActor(policy=_always("patch", WRONG)), envs)
         with pytest.raises(RuntimeError, match="reviewer endpoint down"):
-            await _forest(ScriptedActor(policy=_always("patch", WRONG)), broken_reviewer, envs)
+            await build_forest(task, prompt_ids(task), ctx)
 
         assert envs.all_envs() and all(env.closed for env in envs.all_envs())

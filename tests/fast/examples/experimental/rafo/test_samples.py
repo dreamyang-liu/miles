@@ -24,7 +24,7 @@ COEF = fixed_coefficients(m=2, k=2, s=4, c=64.0, c_h=32.0)
 
 async def _samples(policy, targets: dict, *, credit: str = "subtree", task=TASK, **config):
     sample = make_task_sample(task)
-    ctx = make_context(ScriptedActor(policy=policy), ScriptedReviewer(targets=targets), EnvLog(), **config)
+    ctx = make_context(ScriptedActor(policy=policy), EnvLog(reviewer=ScriptedReviewer(targets=targets)), **config)
     forest = await build_forest(sample, prompt_ids(sample), ctx)
     return forest, forest_samples(sample, forest, COEF, credit=credit)
 

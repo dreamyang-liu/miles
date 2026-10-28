@@ -11,10 +11,12 @@ from miles.utils.args.schema import A, Arg, BaseConfig
 
 class RafoConfig(BaseConfig):
     rafo_env_path: A[
-        str, Arg(required=True, help="Async factory `make_env(sample) -> RafoEnv` that opens the task environment.")
-    ]
-    rafo_reviewer_path: A[
-        str, Arg(required=True, help="Async `review(ReviewRequest) -> ReviewerTurn | None`; None means abstain.")
+        str,
+        Arg(
+            required=True,
+            help="Async factory `make_env(sample) -> RafoEnv`: the rollout service's environment of one episode. "
+            "It also reviews (RafoEnv.review); miles has no reviewer of its own.",
+        ),
     ]
     rafo_tool_specs_path: A[str, Arg(required=True, help="The tool specs of the agent (a list of OpenAI tools).")]
     rafo_tool_call_parser: A[

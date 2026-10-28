@@ -2,13 +2,13 @@
 
 One file of the task holds the bug. ``inspect`` reads a file (a check: it never changes the code); ``patch`` fixes
 a file and runs the tests. A patch of the wrong file is a failed check, and its output shows the failing line. The
-episode ends when the tests pass or the patch budget is used. ``toy_reviewer`` is an oracle reviewer that reads the
-bug file from the label; real runs use a model reviewer.
+episode ends when the tests pass or the patch budget is used. Like a rollout service, the environment also reviews:
+by default with an oracle that knows the bug file; a real rollout service calls its reviewer model.
 """
 
 import json
 import random
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 
 from examples.experimental.rafo.protocols import ReviewerTurn, ReviewRequest, StepResult, ToolCall
@@ -72,9 +72,21 @@ class ToyTask:
         )
 
 
+async def oracle_review(task: ToyTask, request: ReviewRequest) -> ReviewerTurn | None:
+    """Exposes the bug: maps the failing line to its file and inspects that file. Never patches."""
+    return ReviewerTurn(
+        reasoning=(
+            f"The traceback ends at line {task.bug_line}, and line {task.bug_line} is in {task.bug}. "
+            f"So I should check {task.bug} before I patch again."
+        ),
+        tool_calls=(ToolCall(name="inspect", arguments={"path": task.bug}, id=f"call_review_{request.depth}"),),
+    )
+
+
 @dataclass(eq=False)
 class ToyEnv:
     task: ToyTask
+    reviewer: Callable[[ToyTask, ReviewRequest], Awaitable[ReviewerTurn | None]] = oracle_review
     patches: int = 0
     fixed: bool = False
     closed: bool = False
@@ -108,7 +120,13 @@ class ToyEnv:
         return StepResult(outputs=tuple(outputs), failed_check=failed and not self.fixed, done=done)
 
     async def fork(self) -> "ToyEnv":
-        return ToyEnv(task=self.task, patches=self.patches, fixed=self.fixed, opened=self.opened)
+        return ToyEnv(
+            task=self.task, reviewer=self.reviewer, patches=self.patches, fixed=self.fixed, opened=self.opened
+        )
+
+    async def review(self, request: ReviewRequest) -> ReviewerTurn | None:
+        assert not self.closed, "review on a closed environment"
+        return await self.reviewer(self.task, request)
 
     async def reward(self) -> float:
         return 1.0 if self.fixed else 0.0
@@ -119,18 +137,6 @@ class ToyEnv:
 
 async def make_toy_env(sample: Sample) -> ToyEnv:
     return ToyEnv(task=ToyTask.from_label(sample.label))
-
-
-async def toy_reviewer(request: ReviewRequest) -> ReviewerTurn | None:
-    """Exposes the bug: maps the failing line to its file and inspects that file. Never patches."""
-    task = ToyTask.from_label(request.sample.label)
-    return ReviewerTurn(
-        reasoning=(
-            f"The traceback ends at line {task.bug_line}, and line {task.bug_line} is in {task.bug}. "
-            f"So I should check {task.bug} before I patch again."
-        ),
-        tool_calls=(ToolCall(name="inspect", arguments={"path": task.bug}, id=f"call_review_{request.depth}"),),
-    )
 
 
 def sample_toy_task(rng: random.Random, *, n_files: int = 5, max_patches: int = 3) -> ToyTask:

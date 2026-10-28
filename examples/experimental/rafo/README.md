@@ -1,8 +1,8 @@
 # RAFO: reviewer-guided forest RL for agentic coding
 
 RAFO trains a tool-using agent on long-horizon tasks. When every attempt of the agent at a task fails, a fixed
-reviewer model reads a failed attempt and writes one assistant turn **in the agent's first person** at the
-state right after the first failed check. The turn says what to check and why, and contains the tool calls that
+reviewer reads a failed attempt and writes one assistant turn **in the agent's first person** at the state right
+after the first failed check. The turn says what to check and why, and contains the tool calls that
 run the check. It does not contain the fix. The environment runs the check, and the agent continues on its own.
 The agent learns from its own attempts with PPO, and learns the reviewer's turn with cross-entropy, weighted by
 how often the continuations after it succeed.
@@ -16,9 +16,10 @@ how often the continuations after it succeed.
    **checkpoint**: the token stream and transcript up to that tool output, and `env.fork()` as the snapshot.
 2. **Gate.** Only a task whose M roots all fail goes to review; otherwise the root advantages already carry a
    signal.
-3. **Event.** The reviewer reads the full failed root (`ReviewRequest`) and returns a `ReviewerTurn`, or `None`
-   to abstain. The turn is rendered with the agent's chat template and appended at the checkpoint. Its check runs
-   on a fork of the snapshot with `check_only=True`. K continuations then start from forks of that state.
+3. **Event.** miles calls `review(ReviewRequest)` on the checkpoint snapshot. The rollout service's reviewer
+   reads the full failed root and returns a `ReviewerTurn`, or `None` to abstain. miles renders the turn with the
+   agent's chat template and appends it at the checkpoint. Its check runs on a fork of the snapshot with
+   `check_only=True`. K continuations then start from forks of that state.
 4. **Nested review.** If all K continuations fail, the next depth reviews again. With `branch`, it reviews inside
    the first failed continuation, after its own first failed check, so that sequence carries one reviewer turn
    for each depth. With `checkpoint`, the new turn replaces the old one at the same checkpoint. Each event uses
@@ -49,24 +50,29 @@ are not sent to the trainer. A task without any signal keeps one zero-weight sam
 count does not change. π_old comes from the trainer, which recomputes it with the same micro-batches as the
 update.
 
-## Plugging in a task
+## Plugging in a task: the rollout service
 
-- **Environment** (`--rafo-env-path`): an async factory `make_env(sample) -> RafoEnv` (see `protocols.py`).
-  - `step` returns one output for each tool call, `failed_check` (for example a failing test run), and `done`.
-  - `fork` returns an independent copy of the current state: snapshots and continuations depend on it.
-    Container snapshots work, and so does replaying the tool calls into a fresh sandbox.
-  - `reward` scores the final state, and `close` releases the environment.
-  - With `check_only`, the environment must refuse edits.
-- **Reviewer** (`--rafo-reviewer-path`): an async `review(ReviewRequest) -> ReviewerTurn | None`. The request
-  holds the task sample, the full failed transcript, the checkpoint position, the depth and the tool specs.
+The rollout service owns the sandboxes and the reviewer; miles owns the policy, the forest schedule and the
+training. `--rafo-env-path` names an async factory `make_env(sample) -> RafoEnv`, the service's environment of one
+episode (see `protocols.py`):
+
+- `step` runs the tool calls of one assistant turn and returns one output for each call, `failed_check` (for
+  example a failing test run), and `done`. With `check_only` (a reviewer turn), it must refuse edits.
+- `fork` returns an independent copy of the current state: snapshots and continuations depend on it. Sandbox
+  snapshots work, and so does replaying the tool calls into a fresh sandbox.
+- `review` is called on a checkpoint snapshot. The request holds the full failed transcript (miles generated the
+  agent turns, so the service does not have them), the checkpoint position and the depth. miles keeps no reviewer
+  settings: the reviewer model, its prompt and its credentials stay in the rollout service.
   - Put the evidence and the reasoning that lead to the check in `reasoning`. In the reference experiments, turns
     that only ran the check taught the form of a check but not what to check.
   - Thinking-model templates render `reasoning` in their reasoning block. Other templates put it before the
     content.
-  - `toy_env.toy_reviewer` is an oracle for the toy task; for real tasks, wrap the model or API of your choice.
-- **Tools** (`--rafo-tool-specs-path`, `--rafo-tool-call-parser`): the agent's tool specs and the SGLang
-  function-call parser for its output. Do not pass `--apply-chat-template`: RAFO renders the chat prompt with
-  these tools.
+- `reward` scores the final state, and `close` releases the environment.
+
+`toy_env.ToyEnv` is a complete in-process example; its default reviewer is an oracle that knows the bug file.
+
+The agent's tool specs and the SGLang function-call parser for its output come from `--rafo-tool-specs-path` and
+`--rafo-tool-call-parser`. Do not pass `--apply-chat-template`: RAFO renders the chat prompt with these tools.
 
 All flags, their defaults and their checks are in `config.py`.
 
@@ -111,7 +117,7 @@ python examples/experimental/rafo/run_qwen3_0_6b_rafo.py \
 ```
 
 The recipe trains Qwen3-0.6B on the toy bug-finding task in `toy_env.py`. A patch of the wrong file fails the
-tests and shows the failing line; `inspect` is the check. The default reviewer is the toy oracle reviewer.
+tests and shows the failing line; `inspect` is the check. The toy environment reviews with its oracle.
 
 ## Status
 

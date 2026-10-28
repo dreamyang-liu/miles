@@ -19,8 +19,6 @@ SAMPLING_PARAMS = {"max_new_tokens": 64, "temperature": 1.0}
 RAFO_ARGV = [
     "--rafo-env-path",
     "examples.experimental.rafo.toy_env.make_toy_env",
-    "--rafo-reviewer-path",
-    "examples.experimental.rafo.toy_env.toy_reviewer",
     "--rafo-tool-specs-path",
     "examples.experimental.rafo.toy_env.TOOL_SPECS",
     "--rafo-tool-call-parser",

@@ -1,8 +1,7 @@
 import json
 
 from examples.experimental.rafo.protocols import ReviewRequest, ToolCall
-from examples.experimental.rafo.toy_env import ToyEnv, ToyTask, toy_reviewer, write_toy_dataset
-from miles.utils.types import Sample
+from examples.experimental.rafo.toy_env import ToyEnv, ToyTask, write_toy_dataset
 
 
 def _call(name: str, path: str) -> ToolCall:
@@ -58,11 +57,11 @@ class TestToyDataset:
         assert (tmp_path / "a.jsonl").read_text() == (tmp_path / "b.jsonl").read_text()
 
 
-async def test_the_oracle_reviewer_exposes_the_bug_with_a_check_and_no_fix() -> None:
+async def test_the_environment_reviews_with_an_oracle_that_exposes_the_bug_with_a_check_and_no_fix() -> None:
     task = ToyTask(files=("a.py", "b.py"), ranges=((1, 9), (10, 20)), bug="b.py", bug_line=12)
-    request = ReviewRequest(sample=Sample(label=task.to_label()), messages=(), checkpoint=0, depth=1, tools=())
+    snapshot = await ToyEnv(task=task).fork()
 
-    turn = await toy_reviewer(request)
+    turn = await snapshot.review(ReviewRequest(messages=(), checkpoint=0, depth=1))
 
     assert [(c.name, c.arguments) for c in turn.tool_calls] == [("inspect", {"path": "b.py"})]
     assert "line 12" in turn.reasoning and "patch b.py" not in turn.reasoning

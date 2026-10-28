@@ -2,7 +2,7 @@
 
 Trains with reviewer-guided forests (see README.md next to this file): 4 roots for each task, review of the tasks
 whose roots all fail, 2 continuations for each reviewer turn, nested review in the failed branch up to depth 3, and
-the RAFO custom loss. The default reviewer is the toy oracle reviewer; pass --reviewer-path for your own.
+the RAFO custom loss. The toy environment plays the rollout service, including its (oracle) reviewer.
 
 What must exist: nothing. `prepare` downloads Qwen3-0.6B, converts it to Megatron torch_dist next to the HF
 checkpoint, and writes the toy dataset if it does not exist yet; --skip-prepare reuses them.
@@ -10,7 +10,6 @@ checkpoint, and writes the toy dataset if it does not exist yet; --skip-prepare 
 Args:
   --num-gpus-per-node: GPUs of this node; actor and rollout are colocated (default: 1).
   --num-rollout: training iterations (default: 200).
-  --reviewer-path: async review(ReviewRequest) -> ReviewerTurn | None (default: the toy oracle reviewer).
   --model-dir / --data-dir / --output-dir: checkpoint, dataset and output directories.
   --skip-prepare: do not download, convert or write the dataset.
   --extra-args: appended to the train.py arguments.
@@ -40,7 +39,6 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     run_id: str = field(default_factory=command_utils.create_run_id)
     num_gpus_per_node: int = 1
     num_rollout: int = 200
-    reviewer_path: str = f"{_RAFO}.toy_env.toy_reviewer"
     model_dir: str = "/root/models"
     data_dir: str = "/root/datasets"
     megatron_path: str = "/root/Megatron-LM"
@@ -83,7 +81,6 @@ def _rafo_args(args: ScriptArgs) -> str:
     return (
         f"--custom-generate-function-path {_RAFO}.generate.RafoGenerate "
         f"--rafo-env-path {_RAFO}.toy_env.make_toy_env "
-        f"--rafo-reviewer-path {args.reviewer_path} "
         f"--rafo-tool-specs-path {_RAFO}.toy_env.TOOL_SPECS "
         "--rafo-tool-call-parser qwen25 "
         "--rafo-max-turns 8 "

@@ -1,8 +1,8 @@
-"""A scripted agent, a scripted reviewer and the toy environment for CPU tests of the RAFO forest."""
+"""A scripted agent and the toy environment with a scripted reviewer, for CPU tests of the RAFO forest."""
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from examples.experimental.rafo.episode import (
@@ -64,12 +64,12 @@ class ScriptedActor:
 
 @dataclass
 class ScriptedReviewer:
-    """Exposes `targets[depth]` with an inspect; abstains for depths not in `targets`."""
+    """The rollout service's reviewer: exposes `targets[depth]` with an inspect; abstains at other depths."""
 
     targets: dict[int, str]
     requests: list[ReviewRequest] = field(default_factory=list)
 
-    async def __call__(self, request: ReviewRequest) -> ReviewerTurn | None:
+    async def __call__(self, task: ToyTask, request: ReviewRequest) -> ReviewerTurn | None:
         self.requests.append(request)
         if (path := self.targets.get(request.depth)) is None:
             return None
@@ -81,10 +81,11 @@ class ScriptedReviewer:
 
 @dataclass
 class EnvLog:
+    reviewer: Callable[[ToyTask, ReviewRequest], Awaitable[ReviewerTurn | None]]
     roots: list[ToyEnv] = field(default_factory=list)
 
     async def make_env(self, sample: Sample) -> ToyEnv:
-        env = ToyEnv(task=ToyTask.from_label(sample.label))
+        env = ToyEnv(task=ToyTask.from_label(sample.label), reviewer=self.reviewer)
         self.roots.append(env)
         return env
 
@@ -103,7 +104,6 @@ def prompt_ids(sample: Sample) -> list[int]:
 
 def make_context(
     actor: ScriptedActor,
-    reviewer: ScriptedReviewer,
     envs: EnvLog,
     *,
     m: int = 2,
@@ -122,7 +122,6 @@ def make_context(
     return ForestContext(
         episode=episode,
         make_env=envs.make_env,
-        review=reviewer,
         render_turn=lambda turn: render_reviewer_turn(
             TOKENIZER,
             turn,
@@ -130,6 +129,5 @@ def make_context(
             end_of_turn_id=TOKENIZER.eos_token_id,
             reasoning_block=template_renders_reasoning(TOKENIZER),
         ),
-        tools=tuple(TOOL_SPECS),
         config=ForestConfig(m=m, k=k, s=s, d=d, rereview=rereview),
     )

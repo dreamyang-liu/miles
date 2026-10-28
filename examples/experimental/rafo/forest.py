@@ -1,8 +1,8 @@
 """The RAFO forest of one task.
 
-M roots run to the end. If all of them fail (gate all_roots_fail), the reviewer reads each failed root and writes
-one turn at its checkpoint, in the agent's first person, that exposes the problem with a check. The environment
-runs the check from the restored snapshot, and K continuations start after its output. If all continuations of an
+M roots run to the end. If all of them fail (gate all_roots_fail), the rollout service's reviewer reads each failed
+root and writes one turn at its checkpoint, in the agent's first person, that exposes the problem with a check. The
+environment runs the check from the restored snapshot, and K continuations start after its output. If all continuations of an
 event fail, the next depth reviews again: inside the first failed continuation after its own first failed check
 (branch), or at the same checkpoint (checkpoint). Each event uses one of the task's S slots; depth stops at D.
 """
@@ -23,7 +23,7 @@ from examples.experimental.rafo.episode import (
     reviewer_message,
     run_episode,
 )
-from examples.experimental.rafo.protocols import EnvFactory, Reviewer, ReviewerTurn, ReviewRequest
+from examples.experimental.rafo.protocols import EnvFactory, ReviewerTurn, ReviewRequest
 from miles.rollout.generate_utils.tool_call_utils import append_forced_tokens
 from miles.utils.types import Sample
 
@@ -41,9 +41,7 @@ class ForestConfig:
 class ForestContext:
     episode: EpisodeContext
     make_env: EnvFactory
-    review: Reviewer
     render_turn: Callable[[ReviewerTurn], list[int]]  # reviewer turn -> token ids in the agent's chat format
-    tools: tuple[dict[str, Any], ...]
     config: ForestConfig
 
 
@@ -89,7 +87,7 @@ async def build_forest(task: Sample, prompt_ids: list[int], ctx: ForestContext) 
         forest = Forest(roots=roots)
         if forest.aborted or any(root.reward > 0 for root in roots):
             return forest
-        return await _review(task, forest, ctx, tracker)
+        return await _review(forest, ctx, tracker)
     finally:
         await tracker.close_all()
 
@@ -105,7 +103,7 @@ async def run_root(task: Sample, prompt_ids: list[int], ctx: ForestContext) -> E
         await tracker.close_all()
 
 
-async def _review(task: Sample, forest: Forest, ctx: ForestContext, tracker: EnvTracker) -> Forest:
+async def _review(forest: Forest, ctx: ForestContext, tracker: EnvTracker) -> Forest:
     events: list[Event] = []
     reads = abstentions = 0
     slots = ctx.config.s
@@ -118,7 +116,7 @@ async def _review(task: Sample, forest: Forest, ctx: ForestContext, tracker: Env
         accepted: list[tuple[_Candidate, ReviewerTurn]] = []
         while frontier and len(accepted) < slots:  # in order; one read for each candidate a free slot can take
             batch, frontier = frontier[: slots - len(accepted)], frontier[slots - len(accepted) :]
-            turns = await _gather(ctx.review(_request(task, cand, depth, ctx.tools)) for cand in batch)
+            turns = await _gather(cand.checkpoint.env.review(_request(cand, depth)) for cand in batch)
             reads += len(batch)
             for cand, turn in zip(batch, turns, strict=True):
                 if turn is None or not turn.tool_calls:
@@ -211,10 +209,8 @@ def _next_candidate(index: int, event: Event, rereview: str) -> _Candidate:
     )
 
 
-def _request(task: Sample, cand: _Candidate, depth: int, tools: tuple[dict[str, Any], ...]) -> ReviewRequest:
-    return ReviewRequest(
-        sample=task, messages=cand.transcript, checkpoint=len(cand.checkpoint.messages), depth=depth, tools=tools
-    )
+def _request(cand: _Candidate, depth: int) -> ReviewRequest:
+    return ReviewRequest(messages=cand.transcript, checkpoint=len(cand.checkpoint.messages), depth=depth)
 
 
 async def _run(episodes: Iterable[Episode], ctx: ForestContext, tracker: EnvTracker) -> None:

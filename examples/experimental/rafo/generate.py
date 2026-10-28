@@ -22,7 +22,7 @@ from examples.experimental.rafo.episode import (
     template_renders_reasoning,
 )
 from examples.experimental.rafo.forest import ForestContext, build_forest, run_root
-from examples.experimental.rafo.protocols import EnvFactory, Reviewer, ToolCall
+from examples.experimental.rafo.protocols import EnvFactory, ToolCall
 from examples.experimental.rafo.samples import forest_samples
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.generate_utils.generate_endpoint_utils import (
@@ -45,7 +45,6 @@ class _Setup:
     tools: tuple[dict[str, Any], ...]
     parse_tool_calls: Callable[[str], list[ToolCall]]
     make_env: EnvFactory
-    review: Reviewer
     end_of_turn_id: int
     reasoning_block: bool
     url: str
@@ -92,7 +91,6 @@ def _create_setup(args: Namespace, tokenizer) -> _Setup:
         tools=tools,
         parse_tool_calls=make_tool_call_parser(tools, config.rafo_tool_call_parser),
         make_env=load_function(config.rafo_env_path),
-        review=load_function(config.rafo_reviewer_path),
         end_of_turn_id=end_of_turn_id,
         reasoning_block=template_renders_reasoning(tokenizer),
         url=f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate",
@@ -140,9 +138,7 @@ def _forest_context(setup: _Setup, input: GenerateFnInput) -> ForestContext:
     return ForestContext(
         episode=episode,
         make_env=setup.make_env,
-        review=setup.review,
         render_turn=render_turn,
-        tools=setup.tools,
         config=setup.config.forest(),
     )
 
