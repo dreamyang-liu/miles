@@ -6,6 +6,7 @@ from tests.fast.backends.training_utils.loss.loss_test_utils import (
     make_inputs,
     make_parallel_state,
 )
+from tests.fast.backends.training_utils.loss.test_training_logprob_reuse import process_group
 
 from miles.backends.training_utils.loss.objective import loss_function
 from miles.utils.args.custom_function import CustomFunctionConfig
@@ -72,11 +73,16 @@ def _reference_loss(logits: torch.Tensor, inputs: dict, eps: float = 0.2, dual_c
     return total
 
 
+__all__ = ["process_group"]
+
+
 class TestRafoLoss:
-    def test_loss_and_gradient_match_the_per_token_objective(self) -> None:
-        """Fixed coefficients, PPO with dual clip on agent tokens, CE on reviewer tokens; miles divides by B."""
+    @pytest.mark.parametrize("true_on_policy_mode", [True, False], ids=["full_softmax", "vocab_parallel_ce"])
+    def test_loss_and_gradient_match_the_per_token_objective(self, process_group, true_on_policy_mode) -> None:
+        """Fixed coefficients, PPO with dual clip on agent tokens, CE on reviewer tokens; miles divides by B.
+        Megatron training computes log-probs with the vocab-parallel cross entropy (true_on_policy_mode off)."""
         make_parallel_state()
-        args = _args()
+        args = _args(true_on_policy_mode=true_on_policy_mode)
         inputs = _inputs(args)
         logits = inputs["policy_logits"].clone().requires_grad_(True)
         reference_logits = inputs["policy_logits"].clone().requires_grad_(True)

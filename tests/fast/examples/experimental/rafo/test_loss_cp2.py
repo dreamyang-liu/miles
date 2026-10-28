@@ -27,7 +27,7 @@ METADATA = [
 ]
 
 
-def _args(*, allgather_cp: bool) -> ImmutableNamespace:
+def _args(*, allgather_cp: bool, true_on_policy_mode: bool) -> ImmutableNamespace:
     config = CustomFunctionConfig(path="examples.experimental.rafo.loss.rafo_loss_function")
     return ImmutableNamespace(
         **dict(
@@ -37,6 +37,7 @@ def _args(*, allgather_cp: bool) -> ImmutableNamespace:
                 entropy_coef=0.0,
                 eps_clip_c=3.0,
                 allgather_cp=allgather_cp,
+                true_on_policy_mode=true_on_policy_mode,
             )
         )
     )
@@ -76,8 +77,15 @@ def _batch(inputs: dict, *, local_old_log_probs: bool) -> dict:
 
 def _run(rank: int, world_size: int, port: int) -> None:
     init_gloo(rank, world_size, port=port)
+    # the vocab-parallel cross entropy needs a real group per rank; new_group is collective, so build all of them
     tp_group = [dist.new_group([r]) for r in range(world_size)][rank]
-    base_args, cp_args = _args(allgather_cp=False), _args(allgather_cp=True)
+    for true_on_policy_mode in (True, False):
+        _check_cp_matches_cp1(rank, world_size, tp_group, true_on_policy_mode=true_on_policy_mode)
+
+
+def _check_cp_matches_cp1(rank: int, world_size: int, tp_group, *, true_on_policy_mode: bool) -> None:
+    base_args = _args(allgather_cp=False, true_on_policy_mode=true_on_policy_mode)
+    cp_args = _args(allgather_cp=True, true_on_policy_mode=true_on_policy_mode)
     inputs = make_inputs(42, len(PROMPT_LENS), PROMPT_LENS, RESPONSE_LENS, 64, base_args)
     logits = inputs["policy_logits"]
     t_local = logits.size(1) // world_size
