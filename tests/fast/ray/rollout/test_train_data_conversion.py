@@ -1247,6 +1247,23 @@ def test_dp_splits_carry_the_store_plans_per_row(scheduled: bool):
         assert shard["rollout_store_plan"] == [data["rollout_store_plan"][j] for j in shard["partition"]]
 
 
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_dp_splits_carry_the_train_metadata_per_row(scheduled: bool):
+    """Sample.train_metadata reaches the loss as batch["metadata"]; the shard whitelist must keep it per row."""
+    data = _make_split_data(8)
+    data["metadata"] = [{"kind": "ce" if i % 2 else "ppo", "coef": i / 8} for i in range(8)]
+    args = make_args(balance_data=False, micro_batch_size=2, use_dynamic_batch_size=False)
+
+    if scheduled:
+        shards = split_train_data_by_dp_scheduled_raw(args, data, train_parallel_config=FULL_SCHEDULE_CONFIG)
+    else:
+        shards = split_train_data_by_dp_raw(args, data, dp_size=2)
+
+    assert len(shards) == 2
+    for shard in shards:
+        assert shard["metadata"] == [data["metadata"][j] for j in shard["partition"]]
+
+
 class TestOutputStoreTookEffect:
     def _convert(self, samples, **args):
         return convert_samples_to_train_data(

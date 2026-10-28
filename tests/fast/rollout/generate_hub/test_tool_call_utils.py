@@ -1,8 +1,14 @@
 import pytest
 from huggingface_hub import snapshot_download
 
-from miles.rollout.generate_utils.tool_call_utils import _DUMMY_USER, _build_dummy_assistant, tokenize_tool_responses
+from miles.rollout.generate_utils.tool_call_utils import (
+    _DUMMY_USER,
+    _build_dummy_assistant,
+    append_forced_tokens,
+    tokenize_tool_responses,
+)
 from miles.utils.processing_utils import load_tokenizer
+from miles.utils.types import Sample
 
 TOOL_CALL_TEST_MODELS = [
     "Qwen/Qwen2.5-0.5B-Instruct",
@@ -119,3 +125,19 @@ class TestTokenizeToolResponses:
         )
         text_without = tokenizer.apply_chat_template(base_messages, tokenize=False, add_generation_prompt=False)
         return text_with[len(text_without) :]
+
+
+class TestAppendForcedTokens:
+    def test_forced_tokens_extend_the_sample_without_loss_or_sampler_log_probs(self):
+        """Tokens the policy did not sample (tool output, a turn written by another model) are context only."""
+        tokenizer = load_tokenizer("Qwen/Qwen3-0.6B", trust_remote_code=True)
+        sample = Sample(tokens=[1, 2], response="a", response_length=1, loss_mask=[1], rollout_log_probs=[-0.5])
+        token_ids = tokenizer.encode("I should check the parser.", add_special_tokens=False)
+
+        append_forced_tokens(sample, token_ids, tokenizer=tokenizer)
+
+        assert sample.tokens == [1, 2, *token_ids]
+        assert sample.response == "a" + tokenizer.decode(token_ids)
+        assert sample.response_length == 1 + len(token_ids)
+        assert sample.loss_mask == [1] + [0] * len(token_ids)
+        assert sample.rollout_log_probs == [-0.5] + [0.0] * len(token_ids)
