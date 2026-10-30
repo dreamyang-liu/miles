@@ -692,6 +692,7 @@ def _fresh_after(taken: Iterable[int | None]) -> Iterator[int]:
 def drop_zero_advantage_groups(outcomes: list[_GroupRollout | Exception]) -> list[_GroupRollout | Exception]:
     """``outcomes`` with the samples of each group whose rewards are all equal left out, and the count of such
     groups in ``rollout/sprout/groups_zero_advantage``. Unchanged when no group has two rewards."""
+
     def uniform(outcome: _GroupRollout | Exception) -> bool:
         return isinstance(outcome, _GroupRollout) and len({float(s.reward) for s in outcome.samples}) <= 1
 

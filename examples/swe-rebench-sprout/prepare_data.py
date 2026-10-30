@@ -85,6 +85,7 @@ def prepare(
     grade_wall_seconds: int,
     review: dict,
     interface: bool = True,
+    harness: bool = False,
 ) -> int:
     output.mkdir(parents=True, exist_ok=True)
     if any((output / name).exists() for name in OUTPUTS):
@@ -126,9 +127,21 @@ def prepare(
         }
         for task in tasks
     }
+    # Sprout's harness runs in its training mode (Arctic-SWE's): an invalid attempt scores -1 and an
+    # unfinished one 0, both ungraded. Without it, mini-swe-agent runs.
+    run_defaults = (
+        {
+            "slot": "sprout-harness",
+            "agent": "harness",
+            "model": model,
+            "extra": {"harness": {"on_invalid": "terminate"}},
+        }
+        if harness
+        else {"slot": "mini-swe-agent", "model": model}
+    )
     miles_section = {
         "profile": profile,
-        "run_defaults": {"slot": "mini-swe-agent", "model": model},
+        "run_defaults": run_defaults,
         "image_resources": {"cpu": cpu, "memory_mb": memory_mb},
         "grade_wall_seconds": grade_wall_seconds,
         # Without it the driver refuses every search request (HTTP 400).
@@ -215,7 +228,16 @@ def parse_args() -> argparse.Namespace:
         help="absolute directory on the Sprout worker host that will hold tasks.jsonl and log_parsers.py",
     )
     parser.add_argument("--model", required=True, help="the model name Sprout's gateway sends to the policy endpoint")
-    parser.add_argument("--profile", default="mini", help="Sprout Run Store worker profile for the rollouts")
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Sprout Run Store worker profile for the rollouts: mini, or harness with --harness",
+    )
+    parser.add_argument(
+        "--harness",
+        action="store_true",
+        help="run Sprout's sprout-harness slot in its training mode instead of mini-swe-agent (Arctic-SWE's recipe)",
+    )
     parser.add_argument(
         "--api-key-env",
         default="SPROUT_MODEL_API_KEY",
@@ -320,7 +342,7 @@ def main():
         sprout_data=args.sprout_data_dir,
         parser_bytes=parser_bytes,
         model=args.model,
-        profile=args.profile,
+        profile=args.profile or ("harness" if args.harness else "mini"),
         api_key_env=args.api_key_env,
         cpu=args.cpu,
         memory_mb=args.memory_mb,
@@ -329,6 +351,7 @@ def main():
         grade_wall_seconds=args.grade_wall_seconds,
         review=review_section(args),
         interface=args.interface,
+        harness=args.harness,
     )
     print(f"Prepared {count} tasks in {args.output_dir}")
 

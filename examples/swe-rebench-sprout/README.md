@@ -146,6 +146,66 @@ budget is still graded. It arrives with `status="truncated"` and its
 `--sprout-rollout-finalization-timeout-seconds` for the final snapshots and
 grading.
 
+## Sprout's harness (Arctic-SWE)
+
+`run_harness_grpo.py` trains plain GRPO groups of Sprout's own `sprout-harness`
+slot after Arctic-SWE (arXiv 2610.24914), instead of mini-swe-agent. The harness
+offers the paper's three tools (`execute_bash`, `str_replace`, `submit`) and
+checks the raw text that the model sampled, never the server's parse of it. In
+its training mode a malformed turn, a response cut off at the token limit, or a
+loop of repeated calls ends the rollout with reward -1, and a rollout that a turn,
+token or time budget ended before `submit` scores 0, both without a grade
+(the paper's Tables 5 and 18). Only a submission gets its 0/1 test verdict.
+
+Prepare with `--harness`. The driver config then runs the harness in its
+training mode on the `harness` profile of Sprout's example Run Store config:
+
+```bash
+python examples/swe-rebench-sprout/prepare_data.py --harness \
+  --output-dir /root/harness-inputs --sprout-data-dir /home/ubuntu/harness-inputs \
+  --model qwen3.5-4b --limit 0 $(sed 's/^/--select /' examples/swe-rebench-sprout/harness_overfit_pool.txt)
+```
+
+`harness_overfit_pool.txt` is the pool of the first overfit run: the 69 of 96
+tasks that Qwen3.5-4B solved at least once in four rollouts of the harness's
+evaluation mode (`on_invalid: feedback`), as the paper's Section 3.1 selects
+its 160. Then train on one 8-GPU node:
+
+```bash
+python examples/swe-rebench-sprout/run_harness_grpo.py --skip-prepare \
+  --model-dir /root/models --hf-checkpoint /root/models/Qwen3.5-4B --data-dir /root/harness-inputs \
+  --sprout-url http://SPROUT_HOST:11001 --model-endpoint http://THIS_HOST:18081 --output-dir /root/harness-run
+```
+
+The defaults are the paper's overfit run: 32 tasks of 5 rollouts an update, 100
+turns, 32k tokens a response and the harness's 131,072-token trajectory budget,
+the trainer TP 2 x DP 4 with one SGLang engine a GPU. The loss is the paper's
+where Miles can: group-centred advantages without the standard deviation, no
+KL or entropy term, AdamW at 1e-6 with beta2 0.98 and epsilon 1e-15, clipping
+at 1.0, and the token mean over the batch; groups whose rewards are all equal
+are left out of the step. One optimizer step a rollout makes it a plain policy
+gradient: CISPO's importance weights need the rollout's log-probs, which this
+path recomputes.
+
+- `rollout/sprout/resolved_mean`, `invalid_mean` and `stop/<reason>` split the
+  reward, which mixes 1, 0 and -1; `groups_zero_advantage` counts the groups
+  left out.
+- Each turn of a rollout leaves a sandbox snapshot. On a long run, delete the
+  snapshots of finished rollouts with Sprout's `python -m sprout.worker sweep
+  --yes JOURNAL...`, for example over the journals untouched for an hour.
+- On an sm_120 GPU (RTX PRO 6000), Transformer Engine 2.17 picks FlashAttention 4,
+  whose varlen forward returns zeros there: hide `flash-attn-4`'s dist-info in
+  the container so that it falls back to FlashAttention 2.
+- The first run fit two 96 GB GPUs with `--num-gpus-per-node 2
+  --rollout-batch-size 16 --max-turns 60 --max-response-len 16384
+  --max-context-len 81920 --max-tokens-per-gpu 81920` and a 56k-token trajectory
+  budget, and graded the rollouts that a budget ended. Over 28 updates the
+  reward of a task's group rose from -0.72 at its first visit to +0.72 at its
+  seventh (50 tasks by then), the invalid rate fell from 83% to 5% and the
+  resolve rate rose from 10% to 77%, most of it from the format: 92% of the base
+  model's trajectories held a malformed turn, mostly prose between the reasoning
+  and the call.
+
 ## RAFO search
 
 The model repairs well once it sees what went wrong, and samples worse

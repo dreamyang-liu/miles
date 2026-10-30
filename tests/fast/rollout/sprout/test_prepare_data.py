@@ -143,6 +143,29 @@ def test_the_driver_config_carries_what_a_search_needs(prepare_data, monkeypatch
     assert sorted(miles["tasks"]) == list(TASK_IDS)
 
 
+def test_the_rollouts_run_mini_by_default_and_sprouts_harness_in_training_mode_with_harness(
+    prepare_data, monkeypatch, tmp_path
+):
+    (tmp_path / "mini").mkdir()
+    (tmp_path / "harness").mkdir()
+    mini = driver_config(run_script(prepare_data, monkeypatch, tmp_path / "mini", {}))["miles"]
+    harness = driver_config(run_script(prepare_data, monkeypatch, tmp_path / "harness", {"--harness": None}))["miles"]
+
+    assert (mini["profile"], mini["run_defaults"]) == (
+        "mini",
+        {"slot": "mini-swe-agent", "model": "Qwen/Qwen3.8-27B"},
+    )
+    assert (harness["profile"], harness["run_defaults"]) == (
+        "harness",
+        {
+            "slot": "sprout-harness",
+            "agent": "harness",
+            "model": "Qwen/Qwen3.8-27B",
+            "extra": {"harness": {"on_invalid": "terminate"}},
+        },
+    ), "the example Run Store config's harness profile, and the paper's training mode"
+
+
 def test_every_review_setting_and_the_grade_wall_time_are_taken_from_their_flags(prepare_data, monkeypatch, tmp_path):
     miles = driver_config(run_script(prepare_data, monkeypatch, tmp_path, EVERY_FLAG))["miles"]
     assert miles["review"] == {
