@@ -22,7 +22,20 @@ StrictNumber = StrictFloat | StrictInt
 GroupStatus = Literal["queued", "running", "completed", "early_stopped", "failed", "cancelled"]
 TrajectoryStatus = Literal["completed", "truncated"]
 #: ``interrupted``: the attempt failed after closed turns and was cut back to the last of them.
-StopReason = Literal["max_turns_reached", "timeout", "interrupted"]
+#: ``max_total_tokens``: the trajectory spent its token budget. ``format_invalid``,
+#: ``response_truncated`` and ``repetition`` end an invalid attempt (Arctic-SWE, Table 18), whose
+#: reward Sprout fixes at -1 without grading it.
+StopReason = Literal[
+    "max_turns_reached",
+    "timeout",
+    "interrupted",
+    "max_total_tokens",
+    "format_invalid",
+    "response_truncated",
+    "repetition",
+]
+#: The stop reasons of an invalid attempt.
+INVALID_STOP_REASONS = frozenset({"format_invalid", "response_truncated", "repetition"})
 
 #: Group statuses the driver never leaves again.
 TERMINAL_GROUP_STATUSES = frozenset({"completed", "early_stopped", "failed", "cancelled"})

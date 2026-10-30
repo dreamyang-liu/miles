@@ -59,7 +59,14 @@ from miles.rollout.base_types import (
 from miles.rollout.sprout import rafo
 from miles.rollout.sprout.client import SproutRolloutClient
 from miles.rollout.sprout.importer import check_reasoning_is_trained, import_trajectories
-from miles.rollout.sprout.protocol import Budget, RafoSearchSpec, RolloutRequest, RolloutResult, SampleSlot
+from miles.rollout.sprout.protocol import (
+    INVALID_STOP_REASONS,
+    Budget,
+    RafoSearchSpec,
+    RolloutRequest,
+    RolloutResult,
+    SampleSlot,
+)
 from miles.utils.args.custom_function import CustomFunctionConfig
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.processing_utils import load_tokenizer
@@ -153,6 +160,15 @@ class SproutRolloutFn(BaseRolloutFn):
             type=float,
             default=30.0,
             help="Timeout for one HTTP request to the driver.",
+        )
+        group.add_argument(
+            "--sprout-rollout-drop-zero-advantage-groups",
+            action="store_true",
+            help=(
+                "Leave out of the step each plain group whose samples all got the same reward: group-centred "
+                "advantages give it none, and its tokens would only dilute the batch's token mean "
+                "(Arctic-SWE's zero-advantage filter). A step whose every group is so keeps them all."
+            ),
         )
         group.add_argument(
             "--sprout-rollout-rafo",
@@ -262,6 +278,8 @@ class SproutRolloutFn(BaseRolloutFn):
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 raise
+        if getattr(self._args, "sprout_rollout_drop_zero_advantage_groups", False) and self._search is None:
+            outcomes = drop_zero_advantage_groups(outcomes)
         return _step_output(outcomes)
 
     def search_spec(self, roots: int) -> RafoSearchSpec | None:
@@ -671,6 +689,29 @@ def _fresh_after(taken: Iterable[int | None]) -> Iterator[int]:
     return itertools.count(max((value for value in taken if value is not None), default=-1) + 1)
 
 
+def drop_zero_advantage_groups(outcomes: list[_GroupRollout | Exception]) -> list[_GroupRollout | Exception]:
+    """``outcomes`` with the samples of each group whose rewards are all equal left out, and the count of such
+    groups in ``rollout/sprout/groups_zero_advantage``. Unchanged when no group has two rewards."""
+    def uniform(outcome: _GroupRollout | Exception) -> bool:
+        return isinstance(outcome, _GroupRollout) and len({float(s.reward) for s in outcome.samples}) <= 1
+
+    if all(uniform(outcome) or not isinstance(outcome, _GroupRollout) for outcome in outcomes):
+        return outcomes
+    kept: list[_GroupRollout | Exception] = []
+    dropped = 0
+    for outcome in outcomes:
+        if uniform(outcome):
+            assert isinstance(outcome, _GroupRollout)
+            outcome = _GroupRollout(samples=[], result=outcome.result, measured=dict(outcome.measured))
+            dropped += 1
+        kept.append(outcome)
+    for outcome in kept:
+        if isinstance(outcome, _GroupRollout):
+            outcome.measured["rollout/sprout/groups_zero_advantage"] = dropped
+            break
+    return kept
+
+
 def _step_output(outcomes: list[_GroupRollout | Exception]) -> RolloutFnTrainOutput:
     """The step's samples by group, a failed group's as [], and its metrics.
 
@@ -713,4 +754,13 @@ def collect_metrics(results: list[RolloutResult], *, groups_failed: int = 0) -> 
     }
     if gradable:
         metrics["rollout/sprout/reward_mean"] = sum(float(t.reward) for t in gradable) / len(gradable)
+        # The reward mixes resolves (1) with invalid attempts (-1): report each on its own.
+        metrics["rollout/sprout/resolved_mean"] = sum(float(t.reward) == 1.0 for t in gradable) / len(gradable)
+        metrics["rollout/sprout/invalid_mean"] = sum(t.stop_reason in INVALID_STOP_REASONS for t in gradable) / len(
+            gradable
+        )
+    for trajectory in trajectories:
+        if trajectory.stop_reason is not None:
+            key = "rollout/sprout/stop/" + trajectory.stop_reason
+            metrics[key] = metrics.get(key, 0) + 1
     return metrics

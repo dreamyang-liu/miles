@@ -137,6 +137,14 @@ def test_truncated_trajectory_carries_its_reason():
     assert result.trajectories[0].reward == 0
 
 
+@pytest.mark.parametrize("reason", ["format_invalid", "response_truncated", "repetition"])
+def test_an_invalid_attempt_is_a_truncated_trajectory_with_reward_minus_one(reason):
+    body = sprout_result()
+    body["trajectories"][0].update(status="truncated", stop_reason=reason, reward=-1.0)
+    result = RolloutResult.model_validate(body)
+    assert (result.trajectories[0].stop_reason, result.trajectories[0].reward) == (reason, -1.0)
+
+
 def test_acknowledgement_is_id_and_status_only():
     assert Acknowledgement.model_validate({"rollout_job_id": "job", "status": "queued"}).status == "queued"
     with pytest.raises(ValidationError):

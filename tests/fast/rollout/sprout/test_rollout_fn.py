@@ -311,6 +311,39 @@ def test_metrics_leave_what_was_not_graded_out_of_the_reward_mean():
     assert "rollout/sprout/reward_mean" not in collect_metrics([RolloutResult.model_validate(body)])
 
 
+def test_metrics_report_resolves_and_invalid_attempts_apart_from_the_reward_mean():
+    body = sprout_result()
+    resolved = body["trajectories"][0]
+    invalid = {
+        **resolved,
+        "sample_slot_id": "slot-2",
+        "branch_id": "job-2",
+        "reward": -1.0,
+        "status": "truncated",
+        "stop_reason": "format_invalid",
+    }
+    body.update(trajectories=[resolved, invalid], actual_samples=2, max_samples=2)
+    metrics = collect_metrics([RolloutResult.model_validate(body)])
+    assert metrics["rollout/sprout/reward_mean"] == 0.0
+    assert metrics["rollout/sprout/resolved_mean"] == 0.5 and metrics["rollout/sprout/invalid_mean"] == 0.5
+    assert metrics["rollout/sprout/stop/format_invalid"] == 1
+
+
+def test_groups_whose_rewards_are_all_equal_are_left_out_unless_every_group_is():
+    from types import SimpleNamespace
+
+    from miles.rollout.sprout.rollout_fn import _GroupRollout, drop_zero_advantage_groups
+
+    def group(*rewards):
+        return _GroupRollout(samples=[SimpleNamespace(reward=r) for r in rewards], result=None, measured={})
+
+    mixed, flat = group(1.0, -1.0, 0.0), group(-1.0, -1.0, -1.0)
+    kept = drop_zero_advantage_groups([mixed, flat, ValueError("failed")])
+    assert [len(g.samples) for g in kept[:2]] == [3, 0] and isinstance(kept[2], ValueError)
+    assert kept[0].measured["rollout/sprout/groups_zero_advantage"] == 1
+    assert drop_zero_advantage_groups([flat, group(0.0, 0.0)])[0] is flat
+
+
 class Abort(BaseException):
     """Not an ``Exception``: what a group must not swallow (an interrupt, a cancellation)."""
 
