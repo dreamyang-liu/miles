@@ -161,15 +161,18 @@ Prepare with `--harness`. The driver config then runs the harness in its
 training mode on the `harness` profile of Sprout's example Run Store config:
 
 ```bash
-python examples/swe-rebench-sprout/prepare_data.py --harness \
+python -c "from datasets import load_dataset; load_dataset('PrimeIntellect/SWE-rebench-V2-Filtered-Easy-Verified', \
+  revision='2dbfaf87af4d3dd19d63a37c6d436d27fcecc6b2', split='train').to_parquet('/root/easy.parquet')"
+python examples/swe-rebench-sprout/prepare_data.py --harness --source-parquet /root/easy.parquet \
   --output-dir /root/harness-inputs --sprout-data-dir /home/ubuntu/harness-inputs \
   --model qwen3.5-4b --limit 0 $(sed 's/^/--select /' examples/swe-rebench-sprout/harness_overfit_pool.txt)
 ```
 
 `harness_overfit_pool.txt` is the pool of the first overfit run: the 69 of 96
-tasks that Qwen3.5-4B solved at least once in four rollouts of the harness's
-evaluation mode (`on_invalid: feedback`), as the paper's Section 3.1 selects
-its 160. Then train on one 8-GPU node:
+tasks of the Filtered-Easy-Verified set (at the revision above, not the script's
+default dataset) that Qwen3.5-4B solved at least once in four rollouts of the
+harness's evaluation mode (`on_invalid: feedback`), as the paper's Section 3.1
+selects its 160. Then train on one 8-GPU node:
 
 ```bash
 python examples/swe-rebench-sprout/run_harness_grpo.py --skip-prepare \
