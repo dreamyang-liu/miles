@@ -203,10 +203,11 @@ def forest_result(roots: list, events: list | None = None) -> tuple[dict, dict[s
     the order given, as ``(parent, rewards)``: ``parent`` is where its turn went, ``"root:<i>"`` for
     the i-th root or ``"event:<n>:<j>"`` for the j-th continuation of event n (both from 0), and
     ``rewards`` are its continuations' in slot order. A reward of None is a trajectory whose grade gave
-    no verdict, ``LOST`` a slot whose actor failed. Every turn is in reasoning form and checked clean.
+    no verdict, -1 an invalid attempt (``format_invalid``), ``LOST`` a slot whose actor failed. Every turn
+    is in reasoning form and checked clean.
     """
     graded = [reward for reward in roots if reward not in (None, LOST)]
-    counts = {"planned": len(roots), "graded": len(graded), "resolved": int(sum(graded))}
+    counts = {"planned": len(roots), "graded": len(graded), "resolved": sum(reward == 1 for reward in graded)}
     outcome = search_outcome(**counts)
     samples = group(len(roots), group_index=3, first_index=11)
     slots = {f"job:slot:{sample.index}": sample for sample in samples}
@@ -291,11 +292,12 @@ def _trajectory(
     template = sprout_result()["trajectories"][0]
     own = {"role": "assistant", "content": "fixed" if reward == 1 else "done"}
     graded = reward is not None
+    invalid = reward == -1  # Sprout fixes an invalid attempt's reward at -1, without grading it
     metadata = {
         **template["metadata"],
         "job_id": f"job-{index}",
         "attempt_id": f"attempt-job-{index}",
-        "progress": float(reward) if graded else None,
+        "progress": float(reward) if graded and not invalid else None,
         "provenance": provenance,
         "search": search,
         "zero_reason": None if graded else "grade_failed",
@@ -310,6 +312,8 @@ def _trajectory(
             "group": condition,
             "messages": [*history, own],
             "reward": float(reward) if graded else 0.0,
+            "status": "truncated" if invalid else template["status"],
+            "stop_reason": "format_invalid" if invalid else template["stop_reason"],
             "metadata": metadata,
         }
     )

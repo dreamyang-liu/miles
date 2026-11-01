@@ -5,8 +5,9 @@ import itertools
 import pytest
 from tests.fast.rollout.sprout.conftest import LOST, forest_result
 
+from miles.rollout.sprout.forest import read_forest
 from miles.rollout.sprout.protocol import RafoSearchSpec, RolloutResult
-from miles.rollout.sprout.rafo import RafoSettings, assemble_rafo_group, coefficients, rloo
+from miles.rollout.sprout.rafo import RafoSettings, assemble_rafo_group, coefficients, event_weights, rloo
 from miles.rollout.sprout.rafo_role import KIND_REFLECT, KIND_REPAIR, KIND_ROOT, RafoRole
 
 SPEC = RafoSearchSpec(roots=2, continuations=2, depth=3, events=4, review_seconds=1.0, wall_time_seconds=1.0)
@@ -184,6 +185,50 @@ class TestTask:
         _, metrics = credited(mask_generator, body, slots)
 
         assert (metrics[f"{M}events"], metrics[f"{M}events_unchecked"], metrics[f"{M}ppo_samples"]) == (2, 1, 2)
+
+
+class TestInvalidAttempts:
+    """An invalid attempt carries -1. PPO compares the rewards themselves; a turn's weight counts resolves only,
+    -1 and 0 alike unresolved, so that it is never negative."""
+
+    def test_local_rloo_compares_the_rewards_themselves(self, mask_generator):
+        body, slots = forest_result([0.0, -1.0])
+
+        samples, _ = credited(mask_generator, body, slots)
+
+        assert by_group(samples) == {"root": [(KIND_ROOT, 1.0, ROOT), (KIND_ROOT, -1.0, ROOT)]}
+
+    def test_a_turn_weighs_the_share_of_its_continuations_that_resolved(self, mask_generator):
+        """Event 1 [-1, 1]: w = 1/2. Event 2 [-1, 0]: w = 0, though its continuations still train."""
+        body, slots = forest_result([0.0, 0.0], [("root:0", [-1.0, 1.0]), ("root:1", [-1.0, 0.0])])
+
+        samples, metrics = credited(mask_generator, body, slots)
+
+        groups = by_group(samples)
+        assert groups["ce:event:1"] == [(KIND_REFLECT, 0.0, 0.5 * REFLECT)] and "ce:event:2" not in groups
+        assert groups["event:1"] == [(KIND_REPAIR, -2.0, REPAIR), (KIND_REPAIR, 2.0, REPAIR)]
+        assert groups["event:2"] == [(KIND_REPAIR, -1.0, REPAIR), (KIND_REPAIR, 1.0, REPAIR)]
+        assert metrics[f"{M}events_without_gain"] == 1
+
+    @pytest.mark.parametrize("credit, weights", [("subtree", [0.25, 0.5]), ("own", [0.0, 0.5])])
+    def test_no_turn_weighs_less_than_nothing_however_its_continuations_ended(self, mask_generator, credit, weights):
+        """Event 1 [-1, 0]; event 2, inside event 1's second continuation, [1, 0]. By R itself, w1 would be
+        (-1 + 1/2)/2 under subtree credit."""
+        body, slots = forest_result([0.0, -1.0], [("root:0", [-1.0, 0.0]), ("event:1:1", [1.0, 0.0])])
+        forest = read_forest(RolloutResult.model_validate(body), slots, SPEC)
+
+        assert event_weights(forest.events, credit=credit) == weights
+        settings = RafoSettings(c=64.0, c_h=32.0, turn_credit=credit)
+        samples, _ = credited(mask_generator, body, slots, settings=settings)
+        assert all(role(sample).coef >= 0 for sample in samples)
+        assert [coef for _, _, coef in by_group(samples)["ce:event:2"]] == [0.5 * REFLECT]
+
+    def test_the_episode_reward_is_the_share_of_the_roots_that_resolved(self, mask_generator):
+        body, slots = forest_result([1.0, -1.0])
+
+        samples, _ = credited(mask_generator, body, slots)
+
+        assert {sample.metadata["raw_reward"] for sample in samples} == {0.5}, "not the mean reward 0"
 
 
 @pytest.mark.parametrize("settings", [{"c": 0.0}, {"c_h": -1.0}, {"turn_credit": "followed"}])

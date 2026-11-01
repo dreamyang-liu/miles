@@ -10,13 +10,15 @@ events. RAFO trains:
 - each continuation with PPO, its advantage the local RLOO among its event's continuations, with the
   coefficient 1/(S K C);
 - each reviewer turn with CE on the turn alone, with the coefficient w/(S C_h). w is the mean over the
-  event's continuations of c_j = R_j, or under ``subtree`` credit max(R_j, w_u) for each event u
+  event's continuations of c_j = 1[R_j = 1], or under ``subtree`` credit max(c_j, w_u) for each event u
   inside continuation j.
 
-M, S and K are constants of the search, so no coefficient depends on what was sampled. R is the 0/1
-verdict, and a missing trajectory counts for nothing. Every sample of a task shares one rollout id, so
-Miles trains them in one step and divides the step by its tasks; a task without any signal keeps one
-zero-weight root, so that it still counts.
+M, S and K are constants of the search, so no coefficient depends on what was sampled. R is the reward:
+the 0/1 verdict, or -1 for an invalid attempt. The RLOO advantages compare the rewards themselves; a
+turn's weight counts resolves only, -1 and 0 alike unresolved, so that w >= 0. A missing trajectory
+counts for nothing. Every sample of a task shares one rollout id, so Miles trains them in one step and
+divides the step by its tasks; a task without any signal keeps one zero-weight root, so that it still
+counts.
 """
 
 from __future__ import annotations
@@ -107,9 +109,10 @@ def assemble_rafo_group(
     samples = [sample for row in rows if (sample := _render(task, row, indices, counts)) is not None]
     if not samples:
         samples = _placeholder(task, forest.roots, counts)
-    root_values = [member.value for member in forest.roots if member.gradable]
+    graded_roots = [member for member in forest.roots if member.gradable]
+    resolved = sum(member.resolved for member in graded_roots)
     for sample in samples:
-        _annotate_task(sample, task, root_success=sum(root_values) / len(root_values) if root_values else 0.0)
+        _annotate_task(sample, task, root_success=resolved / len(graded_roots) if graded_roots else 0.0)
     return samples, _metric_names(counts)
 
 
@@ -122,8 +125,9 @@ def rloo(values: list[float]) -> list[float]:
 
 
 def event_weights(events: tuple[Event, ...], *, credit: str) -> list[float]:
-    """w of each event's turn: the mean over its gradable continuations of R, or under ``subtree`` credit
-    of max(R, w_u) for each event u inside that continuation. Without a gradable continuation, 0."""
+    """w of each event's turn: the mean over its gradable continuations of 1[R = 1], or under ``subtree``
+    credit of max(1[R = 1], w_u) for each event u inside that continuation. Without a gradable
+    continuation, 0. A -1 counts as unresolved, as a 0 does, so that w >= 0."""
     if credit not in TURN_CREDITS:
         raise ValueError(f"unknown reviewer-turn credit {credit!r}; expected one of {TURN_CREDITS}")
     inside: dict[str, list[int]] = {}  # a trajectory's branch id -> the events whose turn went into it
@@ -134,7 +138,7 @@ def event_weights(events: tuple[Event, ...], *, credit: str) -> list[float]:
         credits = []
         for member in events[index].gradable:
             rescues = inside.get(member.trajectory.branch_id, []) if credit == "subtree" else []
-            credits.append(max([member.value, *(weights[u] for u in rescues)]))
+            credits.append(max([float(member.resolved), *(weights[u] for u in rescues)]))
         weights[index] = sum(credits) / len(credits) if credits else 0.0
     return weights
 

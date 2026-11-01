@@ -199,3 +199,65 @@ def test_a_trajectory_in_a_slot_miles_did_not_allocate_is_refused():
 
     with pytest.raises(ValueError, match="unknown sample_slot_id"):
         read(body, slots)
+
+
+class TestInvalidAttempts:
+    """An invalid attempt (``format_invalid``, ``response_truncated``, ``repetition``) carries -1 without a grade:
+    a graded failure, which Sprout never reviews."""
+
+    def test_an_invalid_root_or_continuation_is_a_graded_failure(self):
+        body, slots = forest_result([0.0, -1.0], [("root:0", [-1.0, 1.0])])
+
+        forest = read(body, slots)
+
+        assert forest.case == "FF"
+        members = [*forest.roots, *forest.events[0].continuations]
+        assert [(m.gradable, m.value, m.resolved) for m in members] == [
+            (True, 0.0, False),
+            (True, -1.0, False),
+            (True, -1.0, False),
+            (True, 1.0, True),
+        ]
+
+    @pytest.mark.parametrize(
+        "roots, case, resolved",
+        [([1.0, -1.0], "TF", 1), ([-1.0, -1.0], "FF", 0), ([-1.0, None], "FF_partial", 0), ([1.0, 1.0], "TT", 2)],
+    )
+    def test_the_roots_are_counted_by_their_resolves_and_minus_one_is_no_negative_resolve(self, roots, case, resolved):
+        body, slots = forest_result(roots)
+
+        forest = read(body, slots)
+
+        assert (forest.case, sum(member.resolved for member in forest.roots)) == (case, resolved)
+
+    def test_a_task_whose_failed_roots_all_ended_invalid_is_ff_and_has_no_event(self):
+        """Sprout reviews no such root: the task's roots alone come back, labelled FF."""
+        body, slots = forest_result([-1.0, -1.0])
+
+        forest = read(body, slots)
+
+        assert (forest.case, forest.events) == ("FF", ())
+        assert all(t["metadata"]["search"]["root_counts"]["graded"] == 2 for t in body["trajectories"])
+
+    def test_minus_one_without_an_invalid_stop_is_refused(self):
+        body, slots = forest_result([0.0, -1.0])
+        members(body, "root")[1].update(status="completed", stop_reason=None)
+
+        with pytest.raises(ValueError, match="RAFO credits a 0/1 verdict, or the -1 of an invalid attempt"):
+            read(body, slots)
+
+    @pytest.mark.parametrize("reward", [0.0, 1.0])
+    def test_an_invalid_stop_with_another_reward_is_refused(self, reward):
+        body, slots = forest_result([0.0, -1.0])
+        members(body, "root")[1]["reward"] = reward
+
+        with pytest.raises(ValueError, match="stopped format_invalid with reward .*; an invalid attempt carries -1"):
+            read(body, slots)
+
+    def test_an_invalid_stop_whose_grade_gave_no_verdict_is_missing_whatever_its_reward(self):
+        body, slots = forest_result([0.0, None])
+        members(body, "root")[1].update(status="truncated", stop_reason="repetition")
+
+        forest = read(body, slots)
+
+        assert [member.gradable for member in forest.roots] == [True, False]

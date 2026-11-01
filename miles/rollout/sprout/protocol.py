@@ -61,14 +61,16 @@ class RafoSearchSpec(FrozenStrictBaseModel):
     """RAFO's forest after the roots (Sprout's ``sprout.search.spec.RafoSearchSpec``).
 
     ``roots`` scratch rollouts take the first slots. Only when no graded root
-    resolved does Sprout review: at one point of each failed root, at most
-    ``events`` of them, a reviewer writes one turn in the agent's own voice
-    that exposes the problem with a check and never fixes it, and
-    ``continuations`` branches restored at the point run after the turn: one
-    event. When every graded continuation of an event failed, the next depth
-    reviews the first of them in the same way, while events are left, up to
-    ``depth``. The branches fill the slots after the roots, ``branches()`` of
-    them.
+    resolved does Sprout review: at one point of each failed root that
+    submitted and that its grade found unresolved, at most ``events`` of them,
+    a reviewer writes one turn in the agent's own voice that exposes the
+    problem with a check and never fixes it, and ``continuations`` branches
+    restored at the point run after the turn: one event. A root that ended
+    invalid (-1), unfinished (0, ungraded) or on a budget is never reviewed.
+    When every graded continuation of an event failed, the next depth reviews
+    the first of them that submitted and was graded unresolved in the same
+    way, while events are left, up to ``depth``. The branches fill the slots
+    after the roots, ``branches()`` of them.
     """
 
     mode: Literal["rafo"] = "rafo"
@@ -146,7 +148,8 @@ class Acknowledgement(FrozenStrictBaseModel):
 
 
 class Trajectory(FrozenStrictBaseModel):
-    """One returned rollout: hint-free messages, the 0/1 verdict as ``reward``, and Sprout's ``metadata``.
+    """One returned rollout: hint-free messages, the 0/1 verdict (an invalid attempt's -1) as ``reward``, and
+    Sprout's ``metadata``.
 
     ``metadata`` stays a free dict; what Miles reads of it:
 

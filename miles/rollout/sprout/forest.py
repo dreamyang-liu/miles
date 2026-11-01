@@ -6,7 +6,8 @@ roots, and the continuations of each event, which run after a reviewer's turn at
 the turn went into). ``read_forest`` reads them into ``Member``s and ``Event``s, and refuses a forest
 that its annotations do not describe or that is larger than its search. Sprout decides whether to
 review by the label of the roots (``search_outcome``), and Miles recomputes the label from the roots
-it receives.
+it receives. A root or a continuation that ended invalid carries -1 (``INVALID_STOP_REASONS``): a graded
+failure, which Sprout never reviews.
 """
 
 from __future__ import annotations
@@ -15,10 +16,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from miles.rollout.sprout.importer import SEARCH_KINDS, unsampled_messages
-from miles.rollout.sprout.protocol import RafoSearchSpec, RolloutResult, Trajectory
+from miles.rollout.sprout.protocol import INVALID_STOP_REASONS, RafoSearchSpec, RolloutResult, Trajectory
 from miles.utils.types import Sample
 
-#: The labels of a task's roots (``search_outcome``). Sprout reviews FF and FF_partial roots only.
+#: The labels of a task's roots (``search_outcome``). Sprout reviews FF and FF_partial roots only, and of
+#: those only the failed roots that submitted and that a grade found unresolved.
 OUTCOMES = ("TT", "TT_partial", "TF", "FF", "FF_partial", "ungraded")
 
 
@@ -26,7 +28,9 @@ def search_outcome(planned: int, graded: int, resolved: int) -> str:
     """A search task's label from its roots: planned, graded (a verdict came back) and resolved.
 
     Sprout labels the roots with the same function (``sprout.search.outcome.search_outcome``); Miles
-    recomputes it from the returned roots and refuses a group Sprout labelled otherwise.
+    recomputes it from the returned roots and refuses a group Sprout labelled otherwise. A root that ended
+    invalid (-1) or unfinished (0) is graded and failed, so a task whose failed roots all ended so is FF
+    (or FF_partial), though Sprout made no event of it.
     """
     if any(type(count) is not int for count in (planned, graded, resolved)) or not (
         0 <= resolved <= graded <= planned
@@ -49,12 +53,17 @@ class Member:
     event: int | None
     #: Its grade gave a verdict. A missing trajectory counts for nothing, not as a 0.
     gradable: bool
-    #: R, the 0/1 verdict.
+    #: R: the 0/1 verdict, or the -1 of an invalid attempt.
     value: float
 
     @property
     def slot(self) -> str:
         return self.trajectory.sample_slot_id
+
+    @property
+    def resolved(self) -> bool:
+        """It resolved the task: R = 1. A -1 and a 0 are both unresolved."""
+        return self.gradable and self.value == 1
 
 
 @dataclass(frozen=True)
@@ -117,8 +126,17 @@ def _member(trajectory: Trajectory) -> Member:
     if trajectory.group != group:
         raise ValueError(f"trajectory {slot!r} is in group {trajectory.group!r}; its annotation puts it in {group!r}")
     gradable = metadata["zero_reason"] is None
-    if gradable and trajectory.reward not in (0, 1):
-        raise ValueError(f"trajectory {slot!r} has reward {trajectory.reward!r}; RAFO credits a 0/1 verdict")
+    if gradable and trajectory.stop_reason in INVALID_STOP_REASONS:
+        if trajectory.reward != -1:
+            raise ValueError(
+                f"trajectory {slot!r} stopped {trajectory.stop_reason} with reward {trajectory.reward!r}; "
+                "an invalid attempt carries -1"
+            )
+    elif gradable and trajectory.reward not in (0, 1):
+        raise ValueError(
+            f"trajectory {slot!r} has reward {trajectory.reward!r}; RAFO credits a 0/1 verdict, "
+            "or the -1 of an invalid attempt"
+        )
     return Member(trajectory=trajectory, event=event, gradable=gradable, value=float(trajectory.reward))
 
 
@@ -131,7 +149,7 @@ def _checked_outcome(members: list[Member], roots: tuple[Member, ...], planned_r
     if len(roots) > planned_roots:
         raise ValueError(f"{len(roots)} root trajectories for {planned_roots} planned roots")
     graded = [member for member in roots if member.gradable]
-    counts = {"planned": planned_roots, "graded": len(graded), "resolved": int(sum(m.value for m in graded))}
+    counts = {"planned": planned_roots, "graded": len(graded), "resolved": sum(m.resolved for m in graded)}
     case = search_outcome(**counts)
     for member in members:
         search = member.trajectory.metadata["search"]

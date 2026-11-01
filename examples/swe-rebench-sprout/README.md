@@ -226,18 +226,22 @@ runs in four steps:
    are graded.
 2. Gate. Only a task none of whose graded roots resolved (`FF` or `FF_partial`)
    is reviewed. Any other task ends at its roots.
-3. Events. The review reads each failed root, at most S of them, and picks one
-   point in it: the state right after the first observation that went wrong.
+3. Events. The review reads each failed root that submitted and that its grade
+   found unresolved, at most S of them. A root that ended invalid (-1), that a
+   budget ended (graded or not) or that was interrupted is never reviewed, and a
+   task without any other failed root ends at its roots. In each root the review
+   picks one point: the state right after the first observation that went wrong.
    There it writes the agent's next turn: what to check and why, and the bash
    commands of the check. The turn never contains the fix, and never edits the
    repository. K continuations restored at the point run after the turn and its
    real output. A turn and its continuations are one event.
 4. Depth. When every graded continuation of an event failed, the next review
-   reads the first of them and writes one more turn in its history, at most D
-   deep and S events in all.
+   reads the first of them that submitted and was graded unresolved, and writes
+   one more turn in its history, at most D deep and S events in all.
 
-The reviewer is the policy itself, under Sprout's RAFO prompts
-(`resources/review/rafo_prompts.yaml`), and it may abstain. Each continuation
+The reviewer is the policy itself, under the review prompts of the roots' slot
+(Sprout's `ReviewSpec.slot`; for `sprout-harness`, one probe-only `execute_bash`
+call), and it may abstain. Each continuation
 comes back with its `group` (`event:<n>`) and with `metadata.search`: its
 `event`, `depth` and the `parent_job_id` that the event's turn went into (a
 root, or a continuation one depth up). Its restored prefix and every inserted
@@ -249,7 +253,11 @@ A trajectory is missing when its actor failed (Sprout names its slot in
 `failed_samples`) or its grade gave no verdict (`metadata.zero_reason`, such as
 `grade_failed`). A missing trajectory is neither resolved nor failed: it trains
 nothing and enters no group below. A patch that does not apply, or tests that
-run out of time, is a verdict: 0.
+run out of time, is a verdict: 0. So are a harness rollout's -1 for an invalid
+attempt and its 0 for one that a budget ended before `submit`, both without a
+grade: each is a failure in its group, and counts as a graded root in the
+task's label. A task whose failed roots all ended so is `FF` (or `FF_partial`),
+with no event.
 
 ### What each sample trains
 
@@ -264,11 +272,12 @@ run out of time, is a verdict: 0.
 
 M, S and K are constants of the search, so no coefficient depends on what was
 sampled; C and C_h are `--sprout-rollout-rafo-c` and `--sprout-rollout-rafo-c-h`.
-A turn's weight w is the mean, over its event's gradable continuations, of R,
-the 0/1 verdict. Under `--sprout-rollout-rafo-turn-credit subtree`, a
-continuation with an event inside it counts max(R, w of that event), so a turn
-whose continuation a deeper review rescued gets credit for it; with `own`, only
-R counts. A continuation's restored prefix and inserted turns are context only:
+The advantages compare the rewards R themselves: 1, 0 or -1. A turn's weight w
+is the mean, over its event's gradable continuations, of 1[R = 1]: a -1 counts
+as unresolved, as a 0 does, so w ≥ 0. Under
+`--sprout-rollout-rafo-turn-credit subtree`, a continuation with an event inside
+it counts max(1[R = 1], w of that event), so a turn whose continuation a deeper
+review rescued gets credit for it; with `own`, only its own resolve counts. A continuation's restored prefix and inserted turns are context only:
 each turn trains once, in its own event's CE sample.
 
 These samples train nothing:
