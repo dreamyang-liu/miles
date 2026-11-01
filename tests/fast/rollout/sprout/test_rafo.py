@@ -159,7 +159,7 @@ class TestTask:
         samples, _ = credited(mask_generator, body, slots)
 
         assert {s.rollout_id for s in samples} == {3} and {s.group_index for s in samples} == {3}
-        assert all(s.metadata["raw_reward"] == 0.0 for s in samples), "the share of the task's roots that resolved"
+        assert all(s.metadata["raw_reward"] == 0.0 for s in samples), "the mean reward of the task's roots"
         assert all(s.train_metadata["sprout_rollout"]["rollout_job_id"] == "job" for s in samples)
 
     def test_a_task_without_signal_keeps_one_zero_weight_root_so_that_it_counts_in_the_step(self, mask_generator):
@@ -223,12 +223,12 @@ class TestInvalidAttempts:
         assert all(role(sample).coef >= 0 for sample in samples)
         assert [coef for _, _, coef in by_group(samples)["ce:event:2"]] == [0.5 * REFLECT]
 
-    def test_the_episode_reward_is_the_share_of_the_roots_that_resolved(self, mask_generator):
+    def test_the_episode_reward_is_the_mean_reward_of_the_roots_as_without_rafo(self, mask_generator):
         body, slots = forest_result([1.0, -1.0])
 
         samples, _ = credited(mask_generator, body, slots)
 
-        assert {sample.metadata["raw_reward"] for sample in samples} == {0.5}, "not the mean reward 0"
+        assert {sample.metadata["raw_reward"] for sample in samples} == {0.0}, "a -1 counts, not the share 0.5"
 
 
 @pytest.mark.parametrize("settings", [{"c": 0.0}, {"c_h": -1.0}, {"turn_credit": "followed"}])

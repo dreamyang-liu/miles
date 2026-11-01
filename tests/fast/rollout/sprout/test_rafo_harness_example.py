@@ -111,7 +111,7 @@ def test_the_harness_example_trains_as_one_task_with_its_rafo_roles(mask_generat
         "event:2": [(KIND_REPAIR, 1.0, REPAIR), (KIND_REPAIR, -1.0, REPAIR), (KIND_REFLECT, 0.0, 0.5 * REFLECT)],
     }
     assert all(RafoRole.of(sample.train_metadata).coef >= 0 for sample in samples)
-    assert {sample.metadata["raw_reward"] for sample in samples} == {0.0}, "no root resolved"
+    assert {sample.metadata["raw_reward"] for sample in samples} == {-1 / 3}, "the roots' mean of 0, -1 and 0"
     metrics = output.metrics
     assert {key.removeprefix(M): metrics[key] for key in (f"{M}cases/FF", f"{M}events", f"{M}nested_events")} == {
         "cases/FF": 1,

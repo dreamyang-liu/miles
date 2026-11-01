@@ -109,10 +109,9 @@ def assemble_rafo_group(
     samples = [sample for row in rows if (sample := _render(task, row, indices, counts)) is not None]
     if not samples:
         samples = _placeholder(task, forest.roots, counts)
-    graded_roots = [member for member in forest.roots if member.gradable]
-    resolved = sum(member.resolved for member in graded_roots)
+    root_rewards = [member.value for member in forest.roots if member.gradable]
     for sample in samples:
-        _annotate_task(sample, task, root_success=resolved / len(graded_roots) if graded_roots else 0.0)
+        _annotate_task(sample, task, root_reward=sum(root_rewards) / len(root_rewards) if root_rewards else 0.0)
     return samples, _metric_names(counts)
 
 
@@ -238,12 +237,14 @@ def _placeholder(task: _Task, roots: tuple[Member, ...], counts: dict[str, int])
     return []
 
 
-def _annotate_task(sample: Sample, task: _Task, *, root_success: float) -> None:
+def _annotate_task(sample: Sample, task: _Task, *, root_reward: float) -> None:
     """The task's identity on each of its samples: one rollout of one prompt group."""
     sample.rollout_id = task.group_index
     sample.group_index = task.group_index
-    # Miles's episode reward: the policy without review, the share of the task's roots that resolved.
-    sample.metadata["raw_reward"] = root_success
+    # Miles's episode reward: the policy without review, the mean reward of the task's roots. A -1 counts as
+    # it does in raw_reward without RAFO, so the curve keeps its meaning when RAFO is turned on; the share
+    # that resolved is Sprout's rollout/sprout/resolved_mean.
+    sample.metadata["raw_reward"] = root_reward
     for lineage in (sample.train_metadata["sprout_rollout"], sample.metadata["sprout_rollout"]):
         lineage.update(rollout_job_id=task.result.rollout_job_id, prompt_group_id=task.result.prompt_group_id)
 

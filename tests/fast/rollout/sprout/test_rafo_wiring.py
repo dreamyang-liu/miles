@@ -136,7 +136,7 @@ def test_the_task_reaches_the_train_data_as_one_rollout_whose_rows_carry_their_r
 
     assert len(set(data["rollout_ids"])) == 1 and len(flat) == 7, "a compact rollout: nothing is trimmed"
     assert [RafoRole.of(row) for row in data["metadata"]] == roles(flat)
-    assert data["raw_reward"] == [0.0] * 7, "the episode reward is the share of the task's roots that resolved"
+    assert data["raw_reward"] == [0.0] * 7, "the episode reward is the mean reward of the task's roots"
 
 
 @pytest.mark.parametrize(
