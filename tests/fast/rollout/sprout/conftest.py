@@ -2,7 +2,8 @@
 
 The JSON fixtures are byte copies of the examples Sprout ships in its
 ``examples/rl_driver/`` (``SPROUT_EXAMPLES``): the request Miles must send, the
-result of a group without a search, and the result of a RAFO search.
+result of a group without a search, and the results of two RAFO searches, one
+of them over harness rollouts with invalid (-1) and unfinished (0) ones.
 ``forest_result`` builds the result of a RAFO search the way Sprout annotates
 one.
 """
@@ -27,6 +28,7 @@ SPROUT_EXAMPLES = {
     "sprout_request.example.json": "request.example.json",
     "sprout_result.example.json": "result.example.json",
     "sprout_rafo_search_result.example.json": "rafo_search_result.example.json",
+    "sprout_rafo_harness_result.example.json": "rafo_harness_result.example.json",
 }
 
 WORDS = [
