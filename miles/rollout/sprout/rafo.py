@@ -36,6 +36,8 @@ from miles.utils.types import Sample
 
 TURN_CREDITS = ("subtree", "own")
 METRICS = (
+    "tasks_root_resolved",  # a root resolved the task
+    "tasks_resolved",  # a root or a continuation resolved it: the tasks the step solves with review
     "events",
     "nested_events",
     "events_trained",
@@ -103,6 +105,8 @@ def assemble_rafo_group(
     coefs = coefficients(spec, settings)
     members = [*forest.roots, *(member for event in forest.events for member in event.continuations)]
     counts.update({f"cases/{forest.case}": 1, "ungradable": sum(not member.gradable for member in members)})
+    counts["tasks_root_resolved"] = int(any(member.resolved for member in forest.roots))
+    counts["tasks_resolved"] = int(any(member.resolved for member in members))
     weights = event_weights(forest.events, credit=settings.turn_credit)
     rows = _ppo_rows(forest, coefs) + _ce_rows(forest.events, weights, coefs, counts)
     task = _Task(result, slot_samples, mask_generator, weight_version, _task_group_index(slot_samples))

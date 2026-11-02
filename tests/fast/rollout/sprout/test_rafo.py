@@ -235,3 +235,22 @@ class TestInvalidAttempts:
 def test_settings_out_of_range_are_rejected(settings: dict) -> None:
     with pytest.raises(ValueError):
         RafoSettings(**{"c": 64.0, "c_h": 32.0, "turn_credit": "subtree", **settings})
+
+
+@pytest.mark.parametrize(
+    "roots, events, by_roots, after_review",
+    [
+        ([1.0, 0.0], None, 1, 1),
+        ([0.0, 0.0], [("root:0", [1.0, 0.0])], 0, 1),
+        ([0.0, -1.0], [("root:0", [0.0, -1.0])], 0, 0),
+    ],
+    ids=["a root resolved it", "a continuation resolved it", "nothing resolved it"],
+)
+def test_a_task_counts_as_resolved_by_its_roots_and_after_review(
+    mask_generator, roots, events, by_roots, after_review
+):
+    body, slots = forest_result(roots, events)
+
+    _, metrics = credited(mask_generator, body, slots)
+
+    assert (metrics[f"{M}tasks_root_resolved"], metrics[f"{M}tasks_resolved"]) == (by_roots, after_review)
