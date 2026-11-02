@@ -254,3 +254,4 @@ def test_a_task_counts_as_resolved_by_its_roots_and_after_review(
     _, metrics = credited(mask_generator, body, slots)
 
     assert (metrics[f"{M}tasks_root_resolved"], metrics[f"{M}tasks_resolved"]) == (by_roots, after_review)
+    assert (metrics[f"{M}roots"], metrics[f"{M}roots_resolved"]) == (len(roots), roots.count(1.0))

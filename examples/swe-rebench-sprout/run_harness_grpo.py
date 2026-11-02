@@ -83,6 +83,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     rafo_events: int = 8
     rafo_review_seconds: float = 1800.0
     rafo_branch_seconds: float = 3600.0
+    #: RAFO's token normalizers: C of a trajectory's PPO tokens, C_h of a reviewer turn's CE tokens.
+    rafo_c: float = 64.0
+    rafo_c_h: float = 32.0
 
     def __post_init__(self):
         if self.num_gpus_per_node % (self.tp * self.cp) or self.num_gpus_per_node % self.engine_tp:
@@ -199,7 +202,8 @@ def _rafo_loss_args(args: ScriptArgs) -> str:
         # One rollout is one task: one optimizer step a rollout batch, divided by its tasks. A group that
         # failed leaves the step short instead of dropping it.
         f"--global-batch-size {args.rollout_batch_size} --allow-partial-train-step "
-        "--sprout-rollout-rafo-c 64.0 --sprout-rollout-rafo-c-h 32.0 --sprout-rollout-rafo-turn-credit subtree "
+        f"--sprout-rollout-rafo-c {args.rafo_c} --sprout-rollout-rafo-c-h {args.rafo_c_h} "
+        "--sprout-rollout-rafo-turn-credit subtree "
         "--loss-type custom_loss "
         "--custom-loss-function-path miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function "
         # The RAFO loss reads its advantages from the samples; this pass still computes pi_old.

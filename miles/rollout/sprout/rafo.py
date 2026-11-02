@@ -38,6 +38,8 @@ TURN_CREDITS = ("subtree", "own")
 METRICS = (
     "tasks_root_resolved",  # a root resolved the task
     "tasks_resolved",  # a root or a continuation resolved it: the tasks the step solves with review
+    "roots",  # the task's roots: with roots_resolved, the policy's own resolve rate, as without RAFO
+    "roots_resolved",
     "events",
     "nested_events",
     "events_trained",
@@ -107,6 +109,8 @@ def assemble_rafo_group(
     counts.update({f"cases/{forest.case}": 1, "ungradable": sum(not member.gradable for member in members)})
     counts["tasks_root_resolved"] = int(any(member.resolved for member in forest.roots))
     counts["tasks_resolved"] = int(any(member.resolved for member in members))
+    counts["roots"] = len(forest.roots)
+    counts["roots_resolved"] = sum(member.resolved for member in forest.roots)
     weights = event_weights(forest.events, credit=settings.turn_credit)
     rows = _ppo_rows(forest, coefs) + _ce_rows(forest.events, weights, coefs, counts)
     task = _Task(result, slot_samples, mask_generator, weight_version, _task_group_index(slot_samples))
