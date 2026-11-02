@@ -21,6 +21,12 @@ Example (8 GPUs):
       --model-dir /data/models --hf-checkpoint /data/models/Qwen3.5-4B --data-dir /data/harness/train \
       --sprout-url http://127.0.0.1:11002 --model-endpoint http://THIS_HOST:18081 --output-dir /data/harness/run
 
+With ``--rafo`` each task is a RAFO search instead (as in run_qwen3_8_27b.py): when none of its roots
+resolved, Sprout's reviewer writes a probe turn in each failed root that submitted, ``rafo_continuations``
+continuations run after it, and a failed event is reviewed again in a continuation, up to ``rafo_depth``
+deep and ``rafo_events`` events. The RAFO loss trains it: ``--global-batch-size`` counts tasks (one
+optimizer step a rollout batch), with fixed normalizers instead of the token mean.
+
 The first overfit run fit two 96 GB GPUs with ``--num-gpus-per-node 2 --rollout-batch-size 16
 --max-turns 60 --max-response-len 16384 --max-context-len 81920 --max-tokens-per-gpu 81920`` and a
 56k-token trajectory budget in the driver.
@@ -71,6 +77,12 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     lr: float = 1e-6
     save_interval: int = 5
     extra_args: str = ""
+    rafo: bool = False
+    rafo_continuations: int = 2
+    rafo_depth: int = 2
+    rafo_events: int = 8
+    rafo_review_seconds: float = 1800.0
+    rafo_branch_seconds: float = 3600.0
 
     def __post_init__(self):
         if self.num_gpus_per_node % (self.tp * self.cp) or self.num_gpus_per_node % self.engine_tp:
@@ -120,15 +132,26 @@ def train_args(args: ScriptArgs) -> str:
         f"--rollout-max-response-len {args.max_response_len} "
         "--loss-mask-type qwen3 "
     )
-    loss_args = (
-        # A group whose rewards are all equal trains nothing: it is left out, and the one optimizer step of
-        # the rollout trains the rest (a static global batch would trim a short step to nothing).
-        f"--global-batch-size {samples} --use-dynamic-global-batch-size "
-        "--sprout-rollout-drop-zero-advantage-groups "
-        "--advantage-estimator grpo --disable-grpo-std-normalization "
-        "--entropy-coef 0.0 --eps-clip 0.2 --eps-clip-high 0.28 "
-        "--calculate-per-token-loss "
-    )
+    if args.rafo:
+        rollout_args += (
+            "--sprout-rollout-rafo "
+            f"--sprout-rollout-rafo-continuations {args.rafo_continuations} "
+            f"--sprout-rollout-rafo-depth {args.rafo_depth} --sprout-rollout-rafo-events {args.rafo_events} "
+            f"--sprout-rollout-rafo-review-seconds {args.rafo_review_seconds} "
+            f"--sprout-rollout-rafo-wall-time-seconds {args.rafo_branch_seconds} "
+        )
+    if args.rafo:
+        loss_args = _rafo_loss_args(args)
+    else:
+        loss_args = (
+            # A group whose rewards are all equal trains nothing: it is left out, and the one optimizer step of
+            # the rollout trains the rest (a static global batch would trim a short step to nothing).
+            f"--global-batch-size {samples} --use-dynamic-global-batch-size "
+            "--sprout-rollout-drop-zero-advantage-groups "
+            "--advantage-estimator grpo --disable-grpo-std-normalization "
+            "--entropy-coef 0.0 --eps-clip 0.2 --eps-clip-high 0.28 "
+            "--calculate-per-token-loss "
+        )
     optimizer_args = (
         f"--optimizer adam --lr {args.lr} --lr-decay-style constant "
         "--weight-decay 0.0 --adam-beta1 0.9 --adam-beta2 0.98 --adam-eps 1e-15 --clip-grad 1.0 "
@@ -167,6 +190,21 @@ def train_args(args: ScriptArgs) -> str:
         + sglang_args
         + misc_args
         + args.extra_args
+    )
+
+
+def _rafo_loss_args(args: ScriptArgs) -> str:
+    """The RAFO loss (run_qwen3_8_27b.py), with this recipe's clip range and optimizer."""
+    return (
+        # One rollout is one task: one optimizer step a rollout batch, divided by its tasks. A group that
+        # failed leaves the step short instead of dropping it.
+        f"--global-batch-size {args.rollout_batch_size} --allow-partial-train-step "
+        "--sprout-rollout-rafo-c 64.0 --sprout-rollout-rafo-c-h 32.0 --sprout-rollout-rafo-turn-credit subtree "
+        "--loss-type custom_loss "
+        "--custom-loss-function-path miles.backends.training_utils.loss.hub.rafo_loss.rafo_loss_function "
+        # The RAFO loss reads its advantages from the samples; this pass still computes pi_old.
+        "--advantage-estimator grpo --disable-rewards-normalization "
+        "--entropy-coef 0.0 --eps-clip 0.2 --eps-clip-high 0.28 --eps-clip-c 3.0 "
     )
 
 
