@@ -100,11 +100,12 @@ def _reference_shaped(logits: torch.Tensor, inputs: dict, eps: float = 0.2, dual
 
 def test_a_shaped_turn_weighs_each_token_by_two_pi_over_pi_old_plus_one() -> None:
     make_parallel_state()
-    args = _args(sprout_rollout_rafo_turn_loss="shaped")
+    args = _args()
     inputs = _inputs(args)
     inputs["log_probs"][3][4] = -6.0  # a turn token the policy finds unlikely: its weight is about 2 pi_theta
     batch = _batch(inputs)
     batch["metadata"] = [dict(m) for m in TREE_METADATA]
+    batch["metadata"][3] = {"rafo": {**TREE_METADATA[3]["rafo"], "loss": "shaped"}}
     logits = inputs["policy_logits"].clone().requires_grad_(True)
     reference_logits = inputs["policy_logits"].clone().requires_grad_(True)
 
@@ -123,11 +124,16 @@ def test_a_shaped_turn_weighs_each_token_by_two_pi_over_pi_old_plus_one() -> Non
     assert metrics["rafo_turn_shaped_loss"] < 0, "a positive advantage: the shaped loss is -coef * adv * weight"
 
 
-def test_the_turn_loss_setting_is_checked() -> None:
+def test_the_turn_loss_is_checked_on_the_role() -> None:
     make_parallel_state()
-    args = _args(sprout_rollout_rafo_turn_loss="softmax")
+    args = _args()
     inputs = _inputs(args)
     batch = _batch(inputs)
     batch["metadata"] = [dict(m) for m in TREE_METADATA]
+    batch["metadata"][3] = {"rafo": {**TREE_METADATA[3]["rafo"], "loss": "softmax"}}
     with pytest.raises(ValueError, match="turn loss"):
+        loss_function(args, batch, 1, inputs["policy_logits"].clone(), num_rollouts=1)
+    batch["metadata"][3] = dict(TREE_METADATA[3])
+    batch["metadata"][0] = {"rafo": {**TREE_METADATA[0]["rafo"], "loss": "shaped"}}
+    with pytest.raises(ValueError, match="only a reviewer turn"):
         loss_function(args, batch, 1, inputs["policy_logits"].clone(), num_rollouts=1)

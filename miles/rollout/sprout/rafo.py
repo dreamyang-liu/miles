@@ -30,7 +30,15 @@ from typing import NamedTuple
 from miles.rollout.sprout.forest import OUTCOMES, Event, Forest, Member, read_forest, search_outcome
 from miles.rollout.sprout.importer import import_trajectory, prepare_messages, turn_sample, unsampled_messages
 from miles.rollout.sprout.protocol import RafoSearchSpec, RolloutResult
-from miles.rollout.sprout.rafo_role import KIND_REFLECT, KIND_REPAIR, KIND_ROOT, KIND_TURN, METADATA_KEY, RafoRole
+from miles.rollout.sprout.rafo_role import (
+    KIND_REFLECT,
+    KIND_REPAIR,
+    KIND_ROOT,
+    KIND_TURN,
+    METADATA_KEY,
+    TURN_LOSSES,
+    RafoRole,
+)
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.types import Sample
 
@@ -74,10 +82,14 @@ class RafoSettings:
     #: of an attempt that ended at once do not weigh 50-100x per token (GRPO's 1/L bias on short answers).
     length_floor: int = 0
     credit: str = "paper"  # paper | tree | tree_grpo
+    #: How a reviewer turn trains under tree credit: ``ppo``, or ``shaped`` (each token weighs 2 pi / (pi_old + 1)).
+    turn_loss: str = "ppo"
 
     def __post_init__(self) -> None:
         if self.credit not in CREDITS:
             raise ValueError(f"RAFO credit {self.credit!r} is unknown; expected one of {CREDITS}")
+        if self.turn_loss not in TURN_LOSSES:
+            raise ValueError(f"RAFO turn loss {self.turn_loss!r} is unknown; expected one of {TURN_LOSSES}")
         if not (self.c > 0 and self.c_h > 0):
             raise ValueError(f"RAFO's token normalizers must be positive, got c={self.c}, c_h={self.c_h}")
         for name in ("length_ref", "length_floor"):
@@ -137,9 +149,9 @@ def assemble_rafo_group(
     counts["roots"] = len(forest.roots)
     counts["roots_resolved"] = sum(member.resolved for member in forest.roots)
     if settings.credit == "tree":
-        rows = _tree_rows(forest, coefs, counts)
+        rows = _tree_rows(forest, coefs, counts, turn_loss=settings.turn_loss)
     elif settings.credit == "tree_grpo":
-        rows = _tree_grpo_rows(forest, coefs, counts)
+        rows = _tree_grpo_rows(forest, coefs, counts, turn_loss=settings.turn_loss)
     else:
         weights = event_weights(forest.events, credit=settings.turn_credit)
         rows = _ppo_rows(forest, coefs) + _ce_rows(forest.events, weights, coefs, counts)
@@ -207,7 +219,7 @@ def _ppo_rows(forest: Forest, coefs: Coefficients) -> list[_Row]:
     return rows
 
 
-def _tree_rows(forest: Forest, coefs: Coefficients, counts: dict[str, int]) -> list[_Row]:
+def _tree_rows(forest: Forest, coefs: Coefficients, counts: dict[str, int], *, turn_loss: str = "ppo") -> list[_Row]:
     """Tree credit. A leaf is a graded trajectory's own outcome, 1[R = 1]. A node's value V is the share of
     resolved leaves in its subtree. A trajectory compares with its siblings (the task's roots; an event's
     continuations) by local RLOO on its node value: V if an event's turn went into it, else its reward R, -1
@@ -258,7 +270,7 @@ def _tree_rows(forest: Forest, coefs: Coefficients, counts: dict[str, int]) -> l
                 if turn_adv <= 0 or not event.gradable:
                     counts["events_without_gain"] += 1
                 else:
-                    role = RafoRole(kind=KIND_TURN, adv=turn_adv, coef=coefs.reflect)
+                    role = RafoRole(kind=KIND_TURN, adv=turn_adv, coef=coefs.reflect, loss=turn_loss)
                     rows.append(_Row(event.gradable[0], role, turn=event.turn, weight=value))
                 credit_group(event.continuations, KIND_REPAIR, coefs.repair)
 
@@ -266,7 +278,9 @@ def _tree_rows(forest: Forest, coefs: Coefficients, counts: dict[str, int]) -> l
     return rows
 
 
-def _tree_grpo_rows(forest: Forest, coefs: Coefficients, counts: dict[str, int]) -> list[_Row]:
+def _tree_grpo_rows(
+    forest: Forest, coefs: Coefficients, counts: dict[str, int], *, turn_loss: str = "ppo"
+) -> list[_Row]:
     """Tree-GRPO credit. A leaf is a graded trajectory's own reward R (1, 0, or -1). Each root with its
     continuations is one tree; a leaf's advantage is (R - the mean of its tree's leaves) + (R - the mean of the
     task's leaves), the intra- and inter-tree terms of Tree-GRPO without the division by std. A segment's
@@ -313,7 +327,7 @@ def _tree_grpo_rows(forest: Forest, coefs: Coefficients, counts: dict[str, int])
             if turn_adv <= 0 or not event.gradable:
                 counts["events_without_gain"] += 1
             else:
-                role = RafoRole(kind=KIND_TURN, adv=turn_adv, coef=coefs.reflect)
+                role = RafoRole(kind=KIND_TURN, adv=turn_adv, coef=coefs.reflect, loss=turn_loss)
                 rows.append(_Row(event.gradable[0], role, turn=event.turn, weight=turn_adv))
             for continuation in event.continuations:
                 if continuation.gradable:

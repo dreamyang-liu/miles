@@ -5,7 +5,7 @@
 Each sample carries its ``RafoRole`` in ``Sample.train_metadata`` (``batch["metadata"]``): its kind, its local RLOO
 advantage and its fixed coefficient, the token normalizer included. Root and repair samples get PPO with dual clip
 on their loss-mask tokens; a reflect sample gets CE on the reviewer-turn tokens; a turn sample (tree credit) gets PPO
-too, or under ``--sprout-rollout-rafo-turn-loss shaped`` the weight 2 pi_theta / (pi_old + 1) per token in place of
+too, or with ``RafoRole.loss == "shaped"`` (``--sprout-rollout-rafo-turn-loss``) the weight 2 pi_theta / (pi_old + 1) per token in place of
 the PPO ratio: its gradient is A * 2 pi_theta / (pi_old + 1) * grad log pi_theta, which fades out the tokens of the
 reviewer's text that the policy finds unlikely instead of pulling on each with full force. The loss is a plain
 weighted token sum: miles divides each optimizer step by its number of rollouts, one for each task, which supplies the 1/B of the
@@ -20,7 +20,7 @@ import torch
 from miles.backends.training_utils.data.context_parallel import get_local_response_loss_masks
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy
 from miles.backends.training_utils.loss.hub.math_utils import compute_policy_loss
-from miles.rollout.sprout.rafo_role import KIND_REFLECT, KIND_TURN, TURN_LOSSES, RafoRole
+from miles.rollout.sprout.rafo_role import KIND_REFLECT, KIND_TURN, RafoRole
 from miles.utils.types import RolloutBatch
 
 
@@ -32,7 +32,7 @@ def rafo_loss_function(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     del sum_of_sample_mean  # RAFO normalizes by fixed constants, not by per-sample token counts
     _check_supported(args)
-    kinds, advantages, coefficients, segments = _sample_columns(batch)
+    kinds, advantages, coefficients, segments, losses = _sample_columns(batch)
     if any(segments) and getattr(args, "context_parallel_size", 1) > 1:
         raise ValueError("RAFO tree credit's segments index a sample's response positions: use context parallel 1")
     if batch.get("log_probs") is None:
@@ -69,10 +69,8 @@ def rafo_loss_function(
             for advantage, segs, length in zip(advantages, segments, lengths.tolist(), strict=True)
         ]
     ) if len(lengths) else new.new_zeros(0)
-    turn_loss = getattr(args, "sprout_rollout_rafo_turn_loss", "ppo")
-    if turn_loss not in TURN_LOSSES:
-        raise ValueError(f"unknown RAFO turn loss {turn_loss!r}; expected one of {TURN_LOSSES}")
-    shaped_tokens = (active & is_turn) if turn_loss == "shaped" else torch.zeros_like(active)
+    is_shaped = torch.repeat_interleave(torch.tensor([lo == "shaped" for lo in losses], device=new.device), lengths)
+    shaped_tokens = active & is_shaped  # a role allows ``shaped`` on a turn only
     ppo_tokens, ce_tokens = active & ~is_ce & ~shaped_tokens, active & is_ce
     zero = new.new_zeros(())
 
@@ -123,7 +121,7 @@ def token_advantages(
 
 def _sample_columns(
     batch: RolloutBatch,
-) -> tuple[list[str], list[float], list[float], list[tuple[tuple[int, float], ...]]]:
+) -> tuple[list[str], list[float], list[float], list[tuple[tuple[int, float], ...]], list[str]]:
     metadata = batch.get("metadata")
     if metadata is None:
         raise ValueError(
@@ -131,7 +129,13 @@ def _sample_columns(
             "the Megatron backend"
         )
     roles = [RafoRole.of(m) for m in metadata]
-    return [r.kind for r in roles], [r.adv for r in roles], [r.coef for r in roles], [r.segments for r in roles]
+    return (
+        [r.kind for r in roles],
+        [r.adv for r in roles],
+        [r.coef for r in roles],
+        [r.segments for r in roles],
+        [r.loss for r in roles],
+    )
 
 
 def _check_supported(args: Namespace) -> None:

@@ -66,6 +66,21 @@ def test_a_rescued_root_splits_at_the_point_and_its_siblings_pay_for_its_subtree
     assert (metrics[f"{M}events"], metrics[f"{M}events_trained"], metrics[f"{M}events_without_gain"]) == (1, 1, 0)
 
 
+def test_the_turn_loss_setting_rides_on_the_turn_role_only(mask_generator):
+    body, slots = forest_result([0.0, 0.0], [("root:1", [1.0, 0.0])])
+    shaped = RafoSettings(c=64.0, c_h=32.0, turn_credit="subtree", credit="tree", turn_loss="shaped")
+
+    samples, _ = credited(mask_generator, body, slots, settings=shaped)
+
+    losses = {role(s).kind: role(s).loss for s in samples}
+    assert losses == {KIND_ROOT: "ppo", KIND_REPAIR: "ppo", KIND_TURN: "shaped"}
+    (turn,) = [s for s in samples if role(s).kind == KIND_TURN]
+    assert turn.train_metadata["rafo"]["loss"] == "shaped", "the loss reads it from the sample's metadata"
+    assert "loss" not in samples[0].train_metadata["rafo"] or role(samples[0]).kind == KIND_TURN
+    with pytest.raises(ValueError, match="turn loss"):
+        RafoSettings(c=64.0, c_h=32.0, turn_credit="subtree", credit="tree", turn_loss="softmax")
+
+
 def test_a_turn_whose_continuations_all_failed_trains_nothing(mask_generator):
     body, slots = forest_result([0.0, 0.0], [("root:1", [0.0, 0.0])])
 

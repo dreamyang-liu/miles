@@ -39,10 +39,17 @@ class RafoRole:
     #: start on, the tokens take that advantage: a reviewed trajectory's prefix up to the point, then its own
     #: remainder. Empty: ``adv`` everywhere.
     segments: tuple[tuple[int, float], ...] = ()
+    #: How the sample trains: ``ppo`` for every kind, or ``shaped`` for a reviewer turn (``TURN_LOSSES``). Carried
+    #: per sample so that the loss reads it from the batch's metadata, which is the one thing it is sure to get.
+    loss: str = "ppo"
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ValueError(f"unknown RAFO kind {self.kind!r}; expected one of {KINDS}")
+        if self.loss not in TURN_LOSSES:
+            raise ValueError(f"unknown RAFO turn loss {self.loss!r}; expected one of {TURN_LOSSES}")
+        if self.loss != "ppo" and self.kind != KIND_TURN:
+            raise ValueError(f"only a reviewer turn (kind {KIND_TURN!r}) trains with the {self.loss!r} loss")
         if not (math.isfinite(self.adv) and math.isfinite(self.coef) and self.coef >= 0):
             raise ValueError(f"a RAFO role needs a finite adv and a finite coef >= 0, got {self.adv}, {self.coef}")
         if self.kind == KIND_REFLECT and self.adv != 0:
@@ -61,16 +68,20 @@ class RafoRole:
     def to_metadata(self) -> dict:
         role = asdict(self)
         role["segments"] = [[start, adv] for start, adv in self.segments]
+        if self.loss == "ppo":
+            del role["loss"]
         return role
 
     @classmethod
     def of(cls, train_metadata: Mapping | None) -> RafoRole:
         role = (train_metadata or {}).get(METADATA_KEY)
-        if not isinstance(role, Mapping) or not {"kind", "adv", "coef"} <= set(role) <= {"kind", "adv", "coef", "segments"}:
+        if not isinstance(role, Mapping) or not {"kind", "adv", "coef"} <= set(role) <= {"kind", "adv", "coef", "segments", "loss"}:
             raise ValueError(
-                f"a RAFO sample carries train_metadata[{METADATA_KEY!r}] = {{kind, adv, coef[, segments]}} (written by "
+                f"a RAFO sample carries train_metadata[{METADATA_KEY!r}] = {{kind, adv, coef[, segments][, loss]}} (written by "
                 "miles.rollout.sprout.rafo), got "
                 f"{role!r}; the loss sees it as batch['metadata'] under the Megatron backend"
             )
         segments = tuple((int(start), float(adv)) for start, adv in (role.get("segments") or ()))
-        return cls(kind=role["kind"], adv=float(role["adv"]), coef=float(role["coef"]), segments=segments)
+        return cls(
+            kind=role["kind"], adv=float(role["adv"]), coef=float(role["coef"]), segments=segments, loss=role.get("loss", "ppo")
+        )

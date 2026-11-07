@@ -620,6 +620,7 @@ def rafo_settings(args: Any) -> rafo.RafoSettings:
         length_ref=args.sprout_rollout_rafo_length_ref,
         length_floor=args.sprout_rollout_rafo_length_floor,
         credit=args.sprout_rollout_rafo_credit,
+        turn_loss=args.sprout_rollout_rafo_turn_loss,
     )
 
 
