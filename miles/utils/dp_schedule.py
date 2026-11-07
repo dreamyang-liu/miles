@@ -87,18 +87,25 @@ def build_dp_schedule(
     # plus (under --allow-partial-train-step) one smaller final step for the trailing
     # rollouts that would otherwise be dropped.
     num_full_steps = len(rollout_ids) // global_batch_size
-    assert num_full_steps >= 1, (
+    # A batch short of one global batch (a RAFO task whose trajectories were all missing, a Sprout group that
+    # failed) is one short step under --allow-partial-train-step, instead of an error.
+    partial_steps_allowed = args.allow_partial_train_step and args.use_dynamic_batch_size
+    assert num_full_steps >= 1 or (partial_steps_allowed and rollout_ids), (
         f"total rollouts ({len(rollout_ids)}) < global_batch_size ({global_batch_size}); "
-        f"need at least one rollout per step."
+        f"need at least one rollout per step, or --allow-partial-train-step with --use-dynamic-batch-size "
+        f"to train the short batch as one step."
     )
     num_rollouts = [global_batch_size] * num_full_steps
     leftover = len(rollout_ids) - num_full_steps * global_batch_size
-    if leftover and args.allow_partial_train_step and args.use_dynamic_batch_size:
+    if leftover and partial_steps_allowed:
         leftover_samples = sum(len(rollout_id_to_sample_index[rid]) for rid in rollout_ids[-leftover:])
         if leftover_samples >= dp_size:
             num_rollouts.append(leftover)
         else:
             logger.info(f"partial step skipped: {leftover_samples} samples < dp_size {dp_size}")
+    assert num_rollouts, (
+        f"the {len(rollout_ids)} rollouts of this batch have fewer samples than dp_size {dp_size}: no step can be formed"
+    )
 
     partitions: list[list[int]] = [[] for _ in range(dp_size)]
     micro_batch_indices: list[list[list[int]]] = [[] for _ in range(dp_size)]

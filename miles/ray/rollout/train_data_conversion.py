@@ -447,7 +447,12 @@ def can_precompute_dp_schedule(
     if "rollout_ids" not in data:
         return False
     global_batch_size = data.get("dynamic_global_batch_size", args.global_batch_size)
-    return len(set(data["rollout_ids"])) >= global_batch_size
+    rollouts = len(set(data["rollout_ids"]))
+    # Under --allow-partial-train-step a batch short of one global batch still trains, as one short step
+    # (build_dp_schedule); the legacy split below cannot schedule it and asserts in get_data_iterator.
+    if args.allow_partial_train_step and args.use_dynamic_batch_size:
+        return rollouts >= 1
+    return rollouts >= global_batch_size
 
 
 def split_train_data_by_dp_scheduled_raw(

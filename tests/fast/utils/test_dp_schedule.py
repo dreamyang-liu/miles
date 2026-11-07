@@ -331,6 +331,39 @@ def test_partial_final_step_skipped_when_below_dp_size():
     assert len(nmb) == 1
 
 
+def test_short_batch_is_one_partial_step_when_opted_in():
+    """Fewer rollouts than gbs (a RAFO task whose trajectories were all missing): under
+    --allow-partial-train-step the batch trains as one short step instead of failing."""
+    rollout_indices = [0, 0, 1, 2, 2]
+    total_lengths = [3] * 5
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12, allow_partial_train_step=True)
+    tp = make_tp(dp_size=1)
+
+    partitions, mbi, nmb, num_rollouts_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=4, rollout_indices=rollout_indices
+    )
+
+    assert num_rollouts_per_step == [3]
+    assert len(nmb) == 1
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=1,
+        expected_global_sample_indices=range(5),
+        total_lengths=total_lengths,
+        max_per_bin=12,
+    )
+
+
+def test_short_batch_below_dp_size_is_rejected_even_when_opted_in():
+    """A short batch whose samples cannot give every rank one is still an error."""
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12, allow_partial_train_step=True)
+    tp = make_tp(dp_size=2)
+    with pytest.raises(AssertionError, match="dp_size"):
+        build_dp_schedule(args, tp, [3], global_batch_size=4, rollout_indices=[0])
+
+
 def test_rejects_when_fewer_rollouts_than_gbs():
     """gbs=4 with only 3 distinct rollouts -> cannot form one step."""
     args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12)

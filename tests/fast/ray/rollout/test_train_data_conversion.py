@@ -1097,6 +1097,21 @@ class TestCanPrecomputeDpSchedule:
             args=args, data=_make_split_data(6), train_parallel_config=FULL_SCHEDULE_CONFIG
         )
 
+    def test_short_batch_is_eligible_under_allow_partial_train_step(self):
+        """A batch short of one global batch (a RAFO task whose trajectories were all missing, a group that
+        failed) trains as one short step under --allow-partial-train-step; the legacy split cannot schedule it."""
+        args = make_args(
+            balance_data=False,
+            micro_batch_size=1,
+            multi_lora=False,
+            use_dynamic_batch_size=True,
+            max_tokens_per_gpu=64,
+            allow_partial_train_step=True,
+        )  # global_batch_size=8
+        assert can_precompute_dp_schedule(
+            args=args, data=_make_split_data(6), train_parallel_config=FULL_SCHEDULE_CONFIG
+        )
+
     def test_accepts_trailing_partial_step(self):
         """Extra rollouts beyond a full step are fine — the schedule drops them."""
         args = make_args(balance_data=False, micro_batch_size=1, multi_lora=False)  # global_batch_size=8
