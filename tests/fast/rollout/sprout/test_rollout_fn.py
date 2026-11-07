@@ -454,11 +454,15 @@ def test_miles_parser_exposes_the_sprout_flags_once_the_function_is_selected():
         "continuations": 2,
         "depth": 3,
         "events": 4,
+        "length_ref": 0,
+        "length_floor": 0,
+        "credit": "paper",
         "review_seconds": 3600.0,
         "wall_time_seconds": 3600.0,
         "c": 64.0,
         "c_h": 32.0,
         "turn_credit": "subtree",
+        "turn_loss": "ppo",
     }
     removed = ("search_points", "credit", "gsml_lambda", "distill_weight")
     assert not any(hasattr(parsed, f"sprout_rollout_{name}") for name in removed)

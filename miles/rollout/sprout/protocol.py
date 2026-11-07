@@ -60,8 +60,8 @@ class Budget(FrozenStrictBaseModel):
 class RafoSearchSpec(FrozenStrictBaseModel):
     """RAFO's forest after the roots (Sprout's ``sprout.search.spec.RafoSearchSpec``).
 
-    ``roots`` scratch rollouts take the first slots. Only when no graded root
-    resolved does Sprout review: at one point of each failed root that
+    ``roots`` scratch rollouts take the first slots. When a graded root failed
+    (whether or not another resolved), Sprout reviews: at one point of each failed root that
     submitted and that its grade found unresolved, at most ``events`` of them,
     a reviewer writes one turn in the agent's own voice that exposes the
     problem with a check and never fixes it, and ``continuations`` branches

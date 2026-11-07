@@ -19,8 +19,8 @@ from miles.rollout.sprout.importer import SEARCH_KINDS, unsampled_messages
 from miles.rollout.sprout.protocol import INVALID_STOP_REASONS, RafoSearchSpec, RolloutResult, Trajectory
 from miles.utils.types import Sample
 
-#: The labels of a task's roots (``search_outcome``). Sprout reviews FF and FF_partial roots only, and of
-#: those only the failed roots that submitted and that a grade found unresolved.
+#: The labels of a task's roots (``search_outcome``). Sprout reviews a task with a failed root (FF, FF_partial
+#: and TF), and of its roots only the failed ones that submitted and that a grade found unresolved.
 OUTCOMES = ("TT", "TT_partial", "TF", "FF", "FF_partial", "ungraded")
 
 

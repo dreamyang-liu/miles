@@ -56,7 +56,7 @@ from miles.rollout.base_types import (
     RolloutFnTrainInput,
     RolloutFnTrainOutput,
 )
-from miles.rollout.sprout import rafo
+from miles.rollout.sprout import rafo, rafo_role
 from miles.rollout.sprout.client import SproutRolloutClient
 from miles.rollout.sprout.importer import check_reasoning_is_trained, import_trajectories
 from miles.rollout.sprout.protocol import (
@@ -223,6 +223,39 @@ class SproutRolloutFn(BaseRolloutFn):
             help="RAFO's token normalizer C_h of a reviewer turn's CE tokens.",
         )
         group.add_argument(
+            "--sprout-rollout-rafo-length-ref",
+            type=int,
+            default=0,
+            help=(
+                "Tokens. When positive, a PPO sample's coefficient is scaled by this over its trained tokens, so "
+                "that every trajectory weighs the same whatever its length (a sequence mean), instead of RAFO's "
+                "token sum under which the longest failed trajectories dominate. 0 keeps the token sum."
+            ),
+        )
+        group.add_argument(
+            "--sprout-rollout-rafo-length-floor",
+            type=int,
+            default=0,
+            help=(
+                "Tokens. With --sprout-rollout-rafo-length-ref, a trajectory shorter than this counts as this long, "
+                "bounding how much per-token weight a short attempt gets. 0 for no floor."
+            ),
+        )
+        group.add_argument(
+            "--sprout-rollout-rafo-credit",
+            type=str,
+            choices=rafo.CREDITS,
+            default="paper",
+            help=(
+                "How a task's samples are credited: the paper's roles (roots and continuations with local RLOO, the "
+                "reviewer turn with CE weighted by w), or tree credit (every node's value is the share of resolved "
+                "leaves in its subtree; a reviewed trajectory splits at the point into a prefix and a remainder; the "
+                "reviewer turn is the head of its subtree, trained with PPO on V(turn) - R(remainder)), or Tree-GRPO "
+                "credit (a leaf's advantage is (R - its tree's mean) + (R - the task's mean), no std; a segment sums the "
+                "leaf advantages below it; the reviewer turn takes its continuations' sum when positive, with PPO)."
+            ),
+        )
+        group.add_argument(
             "--sprout-rollout-rafo-turn-credit",
             type=str,
             choices=rafo.TURN_CREDITS,
@@ -230,6 +263,17 @@ class SproutRolloutFn(BaseRolloutFn):
             help=(
                 "A reviewer turn's weight: a continuation that a deeper event rescued counts with that event's "
                 "weight (subtree), or only the turn's own continuations count (own)."
+            ),
+        )
+        group.add_argument(
+            "--sprout-rollout-rafo-turn-loss",
+            type=str,
+            choices=rafo_role.TURN_LOSSES,
+            default="ppo",
+            help=(
+                "How a reviewer turn trains under tree credit (kind turn): PPO like any sample, or shaped: each token "
+                "weighs 2 pi_theta / (pi_old + 1) instead of the PPO ratio, so that a token the policy finds unlikely "
+                "(off-policy reviewer text) contributes ~2 pi_theta of its gradient instead of all of it."
             ),
         )
         return parser
@@ -573,6 +617,9 @@ def rafo_settings(args: Any) -> rafo.RafoSettings:
         c=args.sprout_rollout_rafo_c,
         c_h=args.sprout_rollout_rafo_c_h,
         turn_credit=args.sprout_rollout_rafo_turn_credit,
+        length_ref=args.sprout_rollout_rafo_length_ref,
+        length_floor=args.sprout_rollout_rafo_length_floor,
+        credit=args.sprout_rollout_rafo_credit,
     )
 
 

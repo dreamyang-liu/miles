@@ -170,6 +170,47 @@ class TestTask:
         assert [(role(s).kind, role(s).coef) for s in samples] == [(KIND_ROOT, 0.0)]
         assert metrics[f"{M}placeholders"] == 1 and metrics[f"{M}cases/TT"] == 1
 
+    def test_a_length_reference_weighs_every_ppo_trajectory_alike_and_leaves_the_turns(self, mask_generator):
+        """length_ref: a PPO sample's coef becomes coef * length_ref / its trained tokens, so each trajectory
+        contributes |A| * length_ref / (M C) whatever its length; a reviewer turn's CE coef is untouched."""
+        body, slots = forest_result([1.0, 0.0], [("root:1", [1.0, 0.0])])
+        settings = RafoSettings(c=64.0, c_h=32.0, turn_credit="subtree", length_ref=1000)
+
+        plain, _ = credited(mask_generator, body, slots)
+        scaled, _ = credited(mask_generator, body, slots, settings=settings)
+
+        # two roots and two continuations under PPO, one reviewer turn under CE
+        assert len(scaled) == len(plain) == 5
+        assert sorted(role(s).kind for s in plain) == [KIND_REFLECT, KIND_REPAIR, KIND_REPAIR, KIND_ROOT, KIND_ROOT]
+        for before, after in zip(plain, scaled, strict=True):
+            trained = sum(after.loss_mask)
+            if role(before).kind == KIND_REFLECT:
+                assert role(after) == role(before)
+            else:
+                assert trained > 0
+                assert role(after).coef == pytest.approx(role(before).coef * 1000 / trained)
+                assert role(after).coef * trained == pytest.approx(role(before).coef * 1000)
+
+    def test_a_length_floor_bounds_the_weight_of_a_short_trajectory(self, mask_generator):
+        """Under length_floor every PPO trajectory shorter than the floor is weighed as if it were floor tokens
+        long, so a few hundred tokens of an attempt that ended at once get at most length_ref / floor per token."""
+        body, slots = forest_result([1.0, 0.0], [("root:1", [1.0, 0.0])])
+        floor = 10**6  # longer than any test trajectory: every PPO coef becomes coef * length_ref / floor
+        settings = RafoSettings(c=64.0, c_h=32.0, turn_credit="subtree", length_ref=1000, length_floor=floor)
+
+        plain, _ = credited(mask_generator, body, slots)
+        floored, _ = credited(mask_generator, body, slots, settings=settings)
+
+        for before, after in zip(plain, floored, strict=True):
+            if role(before).kind == KIND_REFLECT:
+                assert role(after) == role(before)
+            else:
+                assert role(after).coef == pytest.approx(role(before).coef * 1000 / floor)
+
+    def test_a_length_reference_must_be_a_token_count(self):
+        with pytest.raises(ValueError, match="length_ref"):
+            RafoSettings(c=64.0, c_h=32.0, turn_credit="subtree", length_ref=-1)
+
     def test_a_group_whose_every_root_was_lost_gives_no_sample(self, mask_generator):
         body, slots = forest_result([LOST, LOST])
 

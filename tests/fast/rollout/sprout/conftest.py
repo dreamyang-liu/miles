@@ -146,6 +146,9 @@ def args(**updates) -> Namespace:
         "sprout_rollout_rafo_c": 64.0,
         "sprout_rollout_rafo_c_h": 32.0,
         "sprout_rollout_rafo_turn_credit": "subtree",
+        "sprout_rollout_rafo_length_ref": 0,
+        "sprout_rollout_rafo_length_floor": 0,
+        "sprout_rollout_rafo_credit": "paper",
     }
     return Namespace(**{**fields, **updates})
 
